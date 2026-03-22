@@ -1,0 +1,33 @@
+[package]
+name = "qjournal"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform native systemd-journald compatible journal reader/writer"
+license = "LGPL-2.1-or-later"
+repository = "https://github.com/quitesh/quited"
+readme = "README.md"
+documentation = "https://docs.rs/qjournal"
+keywords = ["journal", "systemd", "journald", "logging", "journalctl"]
+categories = ["encoding", "parsing"]
+
+[dependencies]
+# libc for clock_gettime on Linux
+libc = "0.2"
+# Cross-platform memory-mapped file I/O
+memmap2 = "0.9"
+# UUID / ID128 generation for file_id, machine_id, seqnum_id, boot_id
+uuid = { version = "1", features = ["v4"] }
+# zstd compression (the format's preferred modern codec)
+zstd = { version = "0.13", optional = true }
+# thiserror for ergonomic error types
+thiserror = "1"
+# byteorder for little-endian layout helpers
+byteorder = "1"
+
+[features]
+default = ["zstd-compression"]
+zstd-compression = ["dep:zstd"]
+
+[[example]]
+name = "write_read"
+path = "examples/write_read.rs"
