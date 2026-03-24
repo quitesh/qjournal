@@ -9,21 +9,6 @@
 // http://eprint.iacr.org/2013/397
 //
 // Rust port from systemd src/libsystemd/sd-journal/fsprg.c
-//
-// SECURITY NOTE: The `num-bigint` crate performs variable-time arithmetic.
-// Operations such as `modpow`, multiplication, and division may leak
-// information about operands through timing side channels.  This is
-// consistent with systemd's original C implementation which uses libgcrypt
-// (also not fully constant-time for all operations).  In the FSPRG use
-// case, the secret primes p and q are only used during `gen_mk` (key
-// generation, done once) and `seek` (seeking to an epoch with the master
-// secret key, done offline).  Neither operation is typically exposed to a
-// network attacker in a timing-oracle scenario.  `BigUint` also does not
-// implement `Zeroize`, so its internal heap allocations are freed but not
-// zeroed on drop.  Note that libgcrypt's `gcry_mpi_release` does wipe limb
-// data via `wipememory()` before freeing, so this is a regression from the
-// C implementation.  A future improvement could use `crypto-bigint` (which
-// supports zeroization) at the cost of fixed-width integer refactoring.
 
 /// Recommended security parameter (bit length of the RSA modulus).
 pub const FSPRG_RECOMMENDED_SECPAR: u32 = 1536;
