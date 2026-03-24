@@ -29,7 +29,6 @@ pub enum Error {
     #[error("End of journal")]
     EndOfJournal,
 
-    #[cfg(feature = "zstd-compression")]
     #[error("Decompression error: {0}")]
     Decompression(String),
 }
