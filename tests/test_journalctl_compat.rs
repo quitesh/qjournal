@@ -178,8 +178,8 @@ fn test_data_entry_array_chain_overflow() {
     }
 
     // All N entries should be visible in forward iteration.
-    let reader = JournalReader::open(&path).unwrap();
-    let all: Vec<_> = reader.entries().collect::<Result<_, _>>().unwrap();
+    let mut reader = JournalReader::open(&path).unwrap();
+    let all: Vec<_> = reader.entries().unwrap();
     assert_eq!(all.len(), N, "forward iter should see all {N} entries");
 
     // entries_for_field on the repeated value must find all N entries.
@@ -303,7 +303,7 @@ fn test_entries_for_field_many_values() {
         w.flush().unwrap();
     }
 
-    let reader = JournalReader::open(&path).unwrap();
+    let mut reader = JournalReader::open(&path).unwrap();
 
     // Every unique COUNTER value should map to exactly one entry.
     for i in 0..N {
@@ -343,8 +343,8 @@ fn test_iteration_ordering() {
         w.flush().unwrap();
     }
 
-    let reader = JournalReader::open(&path).unwrap();
-    let entries: Vec<_> = reader.entries().collect::<Result<_, _>>().unwrap();
+    let mut reader = JournalReader::open(&path).unwrap();
+    let entries: Vec<_> = reader.entries().unwrap();
     assert_eq!(entries.len(), N);
     for (i, e) in entries.iter().enumerate() {
         assert_eq!(
@@ -464,8 +464,8 @@ fn test_large_payload() {
     }
 
     // Round-trip via qjournal reader.
-    let reader = JournalReader::open(&path).unwrap();
-    let entries: Vec<_> = reader.entries().collect::<Result<_, _>>().unwrap();
+    let mut reader = JournalReader::open(&path).unwrap();
+    let entries: Vec<_> = reader.entries().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].get(b"MESSAGE").unwrap(), big_msg.as_slice());
 
@@ -501,10 +501,10 @@ fn test_high_volume_mixed() {
         w.flush().unwrap();
     }
 
-    let reader = JournalReader::open(&path).unwrap();
+    let mut reader = JournalReader::open(&path).unwrap();
 
     // Forward iteration must yield all N entries in order.
-    let all: Vec<_> = reader.entries().collect::<Result<_, _>>().unwrap();
+    let all: Vec<_> = reader.entries().unwrap();
     assert_eq!(all.len(), N, "expected {N} entries from forward iter");
     for (i, e) in all.iter().enumerate() {
         assert_eq!(e.message().unwrap(), format!("item-{i:03}"),
@@ -551,8 +551,8 @@ fn test_seqnum_continuity_across_reopens() {
         w.flush().unwrap();
     }
 
-    let reader = JournalReader::open(&path).unwrap();
-    let entries: Vec<_> = reader.entries().collect::<Result<_, _>>().unwrap();
+    let mut reader = JournalReader::open(&path).unwrap();
+    let entries: Vec<_> = reader.entries().unwrap();
     assert_eq!(entries.len(), 15);
     for i in 1..entries.len() {
         assert!(

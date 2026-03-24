@@ -37,11 +37,11 @@ fn main() -> qjournal::Result<()> {
     }
 
     // --- Read ---
-    let reader = JournalReader::open(&path)?;
+    let mut reader = JournalReader::open(&path)?;
 
     println!("\nAll entries:");
-    for (i, entry) in reader.entries().enumerate() {
-        let entry = entry?;
+    let entries = reader.entries()?;
+    for (i, entry) in entries.iter().enumerate() {
         println!(
             "  [{}] seqnum={} realtime={} msg={:?}",
             i,

@@ -27,9 +27,8 @@
 //! use qjournal::JournalReader;
 //! use std::path::Path;
 //!
-//! let reader = JournalReader::open(Path::new("/tmp/test.journal")).unwrap();
-//! for entry in reader.entries() {
-//!     let entry = entry.unwrap();
+//! let mut reader = JournalReader::open(Path::new("/tmp/test.journal")).unwrap();
+//! for entry in reader.entries().unwrap() {
 //!     if let Some(msg) = entry.get(b"MESSAGE") {
 //!         println!("{}", String::from_utf8_lossy(msg));
 //!     }

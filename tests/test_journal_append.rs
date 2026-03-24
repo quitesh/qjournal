@@ -26,10 +26,10 @@ fn test_journal_append() {
     drop(writer);
 
     // Verify
-    let reader = JournalReader::open(&path).expect("Failed to open reader");
-    let entries: Vec<_> = reader.entries().collect::<Result<_, _>>().unwrap();
+    let mut reader = JournalReader::open(&path).expect("Failed to open reader");
+    let entries = reader.entries().unwrap();
     assert_eq!(entries.len(), 10);
-    
+
     for (i, entry) in entries.iter().enumerate() {
         assert_eq!(entry.message().unwrap(), format!("Initial message {}", i));
         assert_eq!(entry.get(b"ITERATION").unwrap(), i.to_string().as_bytes());

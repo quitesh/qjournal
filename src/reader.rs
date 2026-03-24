@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Journal file reader.
 //!
-//! Ported from systemd's `sd-journal.c` and `journal-file.c`
-//! (`sd_journal_next`, `journal_file_find_data_object`, etc.).
+//! Faithful Rust port of systemd's `journal-file.c` read path:
+//! `journal_file_move_to_object`, `generic_array_get`, `generic_array_bisect`,
+//! `journal_file_next_entry`, `journal_file_find_data_object_with_hash`,
+//! `journal_file_move_to_entry_by_seqnum/realtime/monotonic`, etc.
 
 use std::{
     fs::File,
@@ -10,18 +12,57 @@ use std::{
     path::Path,
 };
 
+use indexmap::IndexMap;
+
 use crate::{
     def::*,
     error::{Error, Result},
-    hash::hash64,
+    writer::{
+        check_object, check_object_header, data_payload_offset, entry_array_item_size,
+        entry_item_size, entry_array_n_items, journal_file_hash_data, offset_is_valid,
+        verify_header,
+    },
 };
+
+// ── Direction enum ────────────────────────────────────────────────────────
+// systemd: journal-file.h:24-28
+
+/// Direction for entry traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Move towards newer entries (increasing offsets/timestamps).
+    Down,
+    /// Move towards older entries (decreasing offsets/timestamps).
+    Up,
+}
+
+// ── Bisection test results ───────────────────────────────────────────────
+// systemd: journal-file.c:2903-2911
+
+const TEST_FOUND: i32 = 0;
+const TEST_LEFT: i32 = 1;
+const TEST_RIGHT: i32 = 2;
+const TEST_GOTO_NEXT: i32 = 3;
+const TEST_GOTO_PREVIOUS: i32 = 4;
+
+// ── Chain cache ──────────────────────────────────────────────────────────
+// systemd: journal-file.c:2662-2710
+
+const CHAIN_CACHE_MAX: usize = 20;
+
+/// systemd: journal-file.c:2662-2669 ChainCacheItem
+#[derive(Debug, Clone)]
+struct ChainCacheItem {
+    first: u64,
+    array: u64,
+    begin: u64,
+    total: u64,
+    last_index: u64,
+}
 
 // ── Public entry type ─────────────────────────────────────────────────────
 
 /// A single log entry as parsed from the journal.
-///
-/// Fields are stored as raw bytes. The key is the field *name* (e.g. `MESSAGE`)
-/// and the value is the field *value* (the bytes after `=`).
 #[derive(Debug, Clone)]
 pub struct JournalEntry {
     /// Per-entry sequence number.
@@ -30,14 +71,9 @@ pub struct JournalEntry {
     pub realtime: u64,
     /// Monotonic timestamp in microseconds since boot.
     pub monotonic: u64,
-    /// Sequence-number ID (128-bit random, stable per file).
-    #[allow(dead_code)]
-    seqnum_id: [u8; 16],
-    /// Boot ID.
-    #[allow(dead_code)]
-    boot_id: [u8; 16],
-    /// All fields as (name, value) pairs. Multiple values for the same name
-    /// are allowed by the format.
+    /// Boot ID (128-bit).
+    pub boot_id: [u8; 16],
+    /// All fields as (name, value) pairs.
     fields: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -64,32 +100,28 @@ impl JournalEntry {
 // ── Public reader ─────────────────────────────────────────────────────────
 
 /// A read-only view of a systemd-journald `.journal` file.
-///
-/// ```rust,no_run
-/// use qjournal::JournalReader;
-/// let r = JournalReader::open("/tmp/test.journal").unwrap();
-/// for entry in r.entries() {
-///     println!("{:?}", entry.unwrap().message());
-/// }
-/// ```
 pub struct JournalReader {
     file: File,
-    /// Byte offset of the data hash table object (past the ObjectHeader).
+    header: Header,
+    /// Whether the file uses keyed hash (siphash24 with file_id).
+    keyed_hash: bool,
+    /// True when the file uses the COMPACT layout.
+    compact: bool,
+    /// Byte offset of the data hash table items (past ObjectHeader).
     data_ht_items: u64,
     data_ht_n: u64,
-    /// True when the file uses the COMPACT layout (4-byte offsets in entries).
-    compact: bool,
     /// Offset of the root entry-array object, or 0.
     entry_array_offset: u64,
-    #[allow(dead_code)]
     n_entries: u64,
-    /// Whether the DATA objects use ZSTD compression.
-    #[allow(dead_code)]
-    zstd: bool,
+    /// Chain cache for bisection acceleration.
+    /// systemd: journal-file.c:2662 (ordered_hashmap keyed by chain first offset)
+    chain_cache: IndexMap<u64, ChainCacheItem>,
 }
 
 impl JournalReader {
     /// Open a journal file for reading.
+    ///
+    /// systemd: journal_file_open() read path
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut file = File::open(path)?;
 
@@ -98,197 +130,272 @@ impl JournalReader {
             .map_err(|_| Error::Truncated { offset: 0 })?;
         let h: Header = unsafe { std::ptr::read_unaligned(hbuf.as_ptr() as *const Header) };
 
-        if h.signature != HEADER_SIGNATURE {
-            return Err(Error::InvalidFile("bad magic bytes".into()));
-        }
+        let file_size = file.metadata()?.len();
+        verify_header(&h, file_size, false)?;
 
         let incompat = from_le32(&h.incompatible_flags);
-        let unsupported = incompat & !incompat::SUPPORTED_READ;
-        if unsupported != 0 {
-            return Err(Error::IncompatibleFlags { flags: unsupported });
-        }
-
+        let keyed_hash = (incompat & incompat::KEYED_HASH) != 0;
         let compact = (incompat & incompat::COMPACT) != 0;
-        let zstd    = (incompat & incompat::COMPRESSED_ZSTD) != 0;
 
-        // data_hash_table_offset already points to the items (past the ObjectHeader),
-        // per systemd's convention.
-        let data_ht_items  = from_le64(&h.data_hash_table_offset);
-        let data_ht_size   = from_le64(&h.data_hash_table_size);
-        let data_ht_n      = data_ht_size / HASH_ITEM_SIZE as u64;
+        let data_ht_items = from_le64(&h.data_hash_table_offset);
+        let data_ht_size = from_le64(&h.data_hash_table_size);
+        let data_ht_n = data_ht_size / HASH_ITEM_SIZE as u64;
 
         Ok(Self {
             file,
+            keyed_hash,
+            compact,
             data_ht_items,
             data_ht_n,
-            compact,
             entry_array_offset: from_le64(&h.entry_array_offset),
             n_entries: from_le64(&h.n_entries),
-            zstd,
+            chain_cache: IndexMap::new(),
+            header: h,
         })
     }
 
-    /// Return an iterator over all entries in chronological order.
-    pub fn entries(&self) -> EntryIter<'_> {
-        EntryIter {
-            reader: self,
-            // We re-open the file for each iterator to avoid borrow issues.
-            file: self.file.try_clone().expect("file clone"),
-            current_array_offset: self.entry_array_offset,
-            current_array_index: 0,
-            done: self.entry_array_offset == 0,
-        }
+    // ══════════════════════════════════════════════════════════════════════
+    // Error classification (matching systemd's IN_SET(r, -EBADMSG, -EADDRNOTAVAIL))
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Returns true if the error indicates corruption (not a fatal I/O error).
+    /// systemd: IN_SET(r, -EBADMSG, -EADDRNOTAVAIL)
+    fn is_corruption_error(e: &Error) -> bool {
+        matches!(e, Error::CorruptObject { .. } | Error::Truncated { .. } | Error::InvalidFile(_))
     }
 
-    /// Look up all entries that contain a specific `field=value` pair.
-    pub fn entries_for_field<N: AsRef<[u8]>, V: AsRef<[u8]>>(
-        &self,
-        name: N,
-        value: V,
-    ) -> Result<Vec<JournalEntry>> {
-        let name  = name.as_ref();
-        let value = value.as_ref();
+    // ══════════════════════════════════════════════════════════════════════
+    // Low-level I/O helpers
+    // ══════════════════════════════════════════════════════════════════════
 
-        let mut payload = Vec::with_capacity(name.len() + 1 + value.len());
-        payload.extend_from_slice(name);
-        payload.push(b'=');
-        payload.extend_from_slice(value);
-
-        let h = hash64(&payload);
-        let bucket = h % self.data_ht_n;
-
-        let mut file = self.file.try_clone()?;
-        let item_off = self.data_ht_items + bucket * HASH_ITEM_SIZE as u64;
-        let item = read_hash_item_from(&mut file, item_off)?;
-        let mut cur = from_le64(&item.head_hash_offset);
-
-        let mut results = Vec::new();
-
-        while cur != 0 {
-            let (stored_h, next, data_payload, entry_offset, entry_array_offset, n_entries) =
-                read_data_object_meta(&mut file, cur, self.compact)?;
-
-            if stored_h == h {
-                // Verify payload match.
-                if data_payload == payload {
-                    // Collect all entries referencing this DATA object.
-                    let entries = self.collect_entries_for_data(
-                        &mut file, entry_offset, entry_array_offset, n_entries,
-                    )?;
-                    results.extend(entries);
-                }
-            }
-            cur = next;
-        }
-
-        Ok(results)
+    fn read_u64_at(&mut self, offset: u64) -> Result<u64> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut buf = [0u8; 8];
+        self.file.read_exact(&mut buf)?;
+        Ok(u64::from_le_bytes(buf))
     }
 
-    // ── Internal helpers ──────────────────────────────────────────────────
+    fn read_u32_at(&mut self, offset: u64) -> Result<u32> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut buf = [0u8; 4];
+        self.file.read_exact(&mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
 
-    fn read_entry_at(&self, file: &mut File, entry_offset: u64) -> Result<JournalEntry> {
-        file.seek(SeekFrom::Start(entry_offset))?;
-        let mut hdr_buf = [0u8; ENTRY_OBJECT_HEADER_SIZE];
-        file.read_exact(&mut hdr_buf)?;
-        let hdr: EntryObjectHeader =
-            unsafe { std::ptr::read_unaligned(hdr_buf.as_ptr() as *const EntryObjectHeader) };
+    fn read_bytes_at(&mut self, offset: u64, n: usize) -> Result<Vec<u8>> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; n];
+        self.file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
 
-        if hdr.object.object_type != ObjectType::Entry as u8 {
+    // ══════════════════════════════════════════════════════════════════════
+    // Object access
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:1088-1136 journal_file_move_to_object
+    ///
+    /// Validate that the object at `offset` is well-formed and of the expected type.
+    /// Returns (object_type, object_size) on success.
+    fn move_to_object(&mut self, expected_type: ObjectType, offset: u64) -> Result<(u8, u64)> {
+        if !valid64(offset) {
             return Err(Error::CorruptObject {
-                offset: entry_offset,
-                reason: format!("expected Entry object, got type {}", hdr.object.object_type),
+                offset,
+                reason: "offset not 8-byte aligned".into(),
+            });
+        }
+        let header_size = from_le64(&self.header.header_size);
+        if offset < header_size {
+            return Err(Error::CorruptObject {
+                offset,
+                reason: "offset inside file header".into(),
             });
         }
 
-        let obj_size = from_le64(&hdr.object.size);
-        let seqnum   = from_le64(&hdr.seqnum);
-        let realtime = from_le64(&hdr.realtime);
-        let monotonic= from_le64(&hdr.monotonic);
-        let boot_id  = hdr.boot_id;
-
-        // How many items?
-        let items_bytes = obj_size
-            .saturating_sub(ENTRY_OBJECT_HEADER_SIZE as u64);
-        let item_size = if self.compact {
-            4u64  // le32 only
-        } else {
-            ENTRY_ITEM_SIZE as u64 // 16
+        // Read ObjectHeader (16 bytes)
+        let obj_type = {
+            self.file.seek(SeekFrom::Start(offset))?;
+            let mut buf = [0u8; 1];
+            self.file.read_exact(&mut buf)?;
+            buf[0]
         };
-        let n_items = items_bytes / item_size;
+        let obj_size = self.read_u64_at(offset + 8)?;
 
-        let mut fields = Vec::with_capacity(n_items as usize);
+        // check_object_header (includes type range + minimum size check)
+        check_object_header(obj_type, obj_size, offset)?;
 
-        // Calculate the base offset of the items array to allow random access
-        let items_base = entry_offset + ENTRY_OBJECT_HEADER_SIZE as u64;
+        // Type check
+        if expected_type != ObjectType::Unused && obj_type != expected_type as u8 {
+            return Err(Error::CorruptObject {
+                offset,
+                reason: format!(
+                    "expected {:?} object, got type {}",
+                    expected_type, obj_type
+                ),
+            });
+        }
 
-        for i in 0..n_items {
-            let item_offset = items_base + i * item_size;
-            file.seek(SeekFrom::Start(item_offset))?;
+        // Per-type validation (systemd: check_object, C:936-1086)
+        // Read type-specific fields for validation
+        let flags = {
+            self.file.seek(SeekFrom::Start(offset + 1))?;
+            let mut buf = [0u8; 1];
+            self.file.read_exact(&mut buf)?;
+            buf[0]
+        };
 
-            let data_off = if self.compact {
-                let mut buf = [0u8; 4];
-                file.read_exact(&mut buf)?;
-                u32::from_le_bytes(buf) as u64
-            } else {
-                let mut buf = [0u8; 16];
-                file.read_exact(&mut buf)?;
-                u64::from_le_bytes(buf[..8].try_into().unwrap())
-            };
+        let otype = ObjectType::try_from(obj_type).unwrap_or(ObjectType::Unused);
+        match otype {
+            ObjectType::Data => {
+                let next_hash = self.read_u64_at(offset + 24)?;
+                let next_field = self.read_u64_at(offset + 32)?;
+                let entry_off = self.read_u64_at(offset + 40)?;
+                let entry_arr = self.read_u64_at(offset + 48)?;
+                let n_ent = self.read_u64_at(offset + 56)?;
+                check_object(otype, obj_size, flags, offset, self.compact,
+                    0, next_hash, next_field, entry_off, entry_arr, n_ent,
+                    0, 0, 0, &[0u8; 16], 0)?;
+            }
+            ObjectType::Entry => {
+                let seqnum = self.read_u64_at(offset + 16)?;
+                let realtime = self.read_u64_at(offset + 24)?;
+                let monotonic = self.read_u64_at(offset + 32)?;
+                let boot_bytes = self.read_bytes_at(offset + 40, 16)?;
+                let mut boot = [0u8; 16];
+                boot.copy_from_slice(&boot_bytes);
+                check_object(otype, obj_size, flags, offset, self.compact,
+                    0, 0, 0, 0, 0, 0,
+                    seqnum, realtime, monotonic, &boot, 0)?;
+            }
+            ObjectType::EntryArray => {
+                let next = self.read_u64_at(offset + OBJECT_HEADER_SIZE as u64)?;
+                check_object(otype, obj_size, flags, offset, self.compact,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, &[0u8; 16], next)?;
+            }
+            _ => {
+                // Field, HashTable, Tag, Unused — minimal validation already done by check_object_header
+            }
+        }
 
-            if data_off == 0 {
+        Ok((obj_type, obj_size))
+    }
+
+    /// systemd: journal-file.h:250-255 journal_file_entry_array_item
+    ///
+    /// Read a single item from an entry array object at the given index.
+    fn entry_array_item(&mut self, arr_offset: u64, index: u64) -> Result<u64> {
+        let item_sz = entry_array_item_size(self.compact);
+        let slot_off = arr_offset + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + index * item_sz;
+        if self.compact {
+            Ok(self.read_u32_at(slot_off)? as u64)
+        } else {
+            self.read_u64_at(slot_off)
+        }
+    }
+
+    /// systemd: journal-file.h:213-218 journal_file_entry_item_object_offset
+    ///
+    /// Read the data object offset from an entry item at the given index.
+    fn entry_item_object_offset(&mut self, entry_offset: u64, index: u64) -> Result<u64> {
+        let item_sz = entry_item_size(self.compact);
+        let slot_off = entry_offset + ENTRY_OBJECT_HEADER_SIZE as u64 + index * item_sz;
+        if self.compact {
+            Ok(self.read_u32_at(slot_off)? as u64)
+        } else {
+            self.read_u64_at(slot_off)
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Data object lookup
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:1621-1691 journal_file_find_data_object_with_hash
+    ///
+    /// Walk the data hash chain for `hash`, compare payloads (with decompression),
+    /// return the offset of the matching DATA object.
+    pub fn find_data_object_with_hash(
+        &mut self,
+        data: &[u8],
+        hash: u64,
+    ) -> Result<Option<u64>> {
+        if self.data_ht_n == 0 {
+            return Ok(None);
+        }
+
+        let h = hash % self.data_ht_n;
+        let item_off = self.data_ht_items + h * HASH_ITEM_SIZE as u64;
+        // Read head_hash_offset from the hash table bucket
+        let mut p = self.read_u64_at(item_off)?;
+
+        // systemd: get_next_hash_offset tracks depth and detects loops
+        let mut prev = 0u64;
+
+        while p > 0 {
+            let (_, _obj_size) = self.move_to_object(ObjectType::Data, p)?;
+
+            let stored_hash = self.read_u64_at(p + 16)?; // data.hash
+            if stored_hash != hash {
+                // Advance to next in chain with loop detection
+                prev = p;
+                p = self.read_u64_at(p + 24)?; // data.next_hash_offset
+                // systemd: journal-file.c:1505 — loop detection
+                if p > 0 && p <= prev {
+                    return Err(Error::InvalidFile("hash chain loop detected".into()));
+                }
                 continue;
             }
 
-            let (name, value) = self.read_data_payload(file, data_off)?;
-            fields.push((name, value));
+            // Compare payload (with decompression)
+            let payload = self.read_data_payload_raw(p)?;
+            if payload.len() == data.len() && payload == data {
+                return Ok(Some(p));
+            }
+
+            prev = p;
+            p = self.read_u64_at(p + 24)?;
+            if p > 0 && p <= prev {
+                return Err(Error::InvalidFile("hash chain loop detected".into()));
+            }
         }
-        Ok(JournalEntry { seqnum, realtime, monotonic, boot_id, seqnum_id: [0; 16], fields })
+
+        Ok(None)
     }
 
-    /// Read the payload of a DATA object, returning (field_name, field_value).
-    fn read_data_payload(&self, file: &mut File, offset: u64) -> Result<(Vec<u8>, Vec<u8>)> {
-        file.seek(SeekFrom::Start(offset))?;
-        let mut hdr_buf = [0u8; DATA_OBJECT_HEADER_SIZE];
-        file.read_exact(&mut hdr_buf)?;
-        let hdr: DataObjectHeader =
-            unsafe { std::ptr::read_unaligned(hdr_buf.as_ptr() as *const DataObjectHeader) };
+    /// systemd: journal-file.c:1693-1708 journal_file_find_data_object
+    pub fn find_data_object(&mut self, data: &[u8]) -> Result<Option<u64>> {
+        let hash = journal_file_hash_data(data, self.keyed_hash, &self.header.file_id);
+        self.find_data_object_with_hash(data, hash)
+    }
 
-        if hdr.object.object_type != ObjectType::Data as u8 {
+    /// Read the raw payload of a DATA object, handling compact mode and decompression.
+    ///
+    /// systemd: journal-file.c:1999-2034 journal_file_data_payload
+    fn read_data_payload_raw(&mut self, data_offset: u64) -> Result<Vec<u8>> {
+        let obj_size = self.read_u64_at(data_offset + 8)?;
+        let flags_byte = {
+            self.file.seek(SeekFrom::Start(data_offset + 1))?;
+            let mut buf = [0u8; 1];
+            self.file.read_exact(&mut buf)?;
+            buf[0]
+        };
+
+        let poffset = data_payload_offset(self.compact);
+        if obj_size < poffset {
             return Err(Error::CorruptObject {
-                offset,
-                reason: format!("expected Data object, got type {}", hdr.object.object_type),
+                offset: data_offset,
+                reason: format!("DATA object size {} < minimum {}", obj_size, poffset),
             });
         }
+        let payload_len = (obj_size - poffset) as usize;
+        let raw = self.read_bytes_at(data_offset + poffset, payload_len)?;
 
-        let obj_size = from_le64(&hdr.object.size);
-        let flags    = hdr.object.flags;
-
-        // In compact mode, the DATA object has two extra fields before the payload:
-        //   tail_entry_array_offset (le32) + tail_entry_array_n_entries (le32) = 8 bytes.
-        let payload_base = if self.compact {
-            DATA_OBJECT_HEADER_SIZE as u64 + 8
-        } else {
-            DATA_OBJECT_HEADER_SIZE as u64
-        };
-        let payload_len = obj_size.saturating_sub(payload_base);
-
-        // Skip the compact-mode extra fields if present.
-        if self.compact {
-            file.seek(SeekFrom::Current(8))?;
-        }
-
-        let raw = {
-            let mut raw = vec![0u8; payload_len as usize];
-            file.read_exact(&mut raw)?;
-            raw
-        };
-
-        // Decompress if needed.
-        let payload = if (flags & obj_flags::COMPRESSED_ZSTD) != 0 {
+        let compressed = flags_byte & obj_flags::COMPRESSED_MASK;
+        if compressed & obj_flags::COMPRESSED_ZSTD != 0 {
             #[cfg(feature = "zstd-compression")]
             {
-                zstd::decode_all(raw.as_slice())
-                    .map_err(|e| Error::Decompression(e.to_string()))?
+                return zstd::decode_all(raw.as_slice())
+                    .map_err(|e| Error::Decompression(e.to_string()));
             }
             #[cfg(not(feature = "zstd-compression"))]
             {
@@ -296,220 +403,999 @@ impl JournalReader {
                     "journal uses ZSTD compression but feature not enabled".into(),
                 ));
             }
-        } else if (flags & obj_flags::COMPRESSED_MASK) != 0 {
+        } else if compressed != 0 {
             return Err(Error::InvalidFile(
                 "journal uses LZ4 or XZ compression which is not supported".into(),
             ));
-        } else {
-            raw
-        };
+        }
 
-        // Split on first '='.
+        Ok(raw)
+    }
+
+    /// Read the payload of a DATA object, split into (field_name, field_value).
+    pub fn read_data_payload(&mut self, offset: u64) -> Result<(Vec<u8>, Vec<u8>)> {
+        let (obj_type, _) = self.move_to_object(ObjectType::Data, offset)?;
+        if obj_type != ObjectType::Data as u8 {
+            return Err(Error::CorruptObject {
+                offset,
+                reason: format!("expected Data object, got type {}", obj_type),
+            });
+        }
+
+        let payload = self.read_data_payload_raw(offset)?;
+
         if let Some(eq) = payload.iter().position(|&b| b == b'=') {
             Ok((payload[..eq].to_vec(), payload[eq + 1..].to_vec()))
         } else {
-            // Binary field without '=' — key only
             Ok((payload, Vec::new()))
         }
     }
 
-    /// Collect all entries that reference a particular DATA object.
-    fn collect_entries_for_data(
-        &self,
-        file: &mut File,
-        entry_offset: u64,
-        entry_array_offset: u64,
-        n_entries: u64,
-    ) -> Result<Vec<JournalEntry>> {
-        let mut results = Vec::new();
+    // ══════════════════════════════════════════════════════════════════════
+    // Entry reading
+    // ══════════════════════════════════════════════════════════════════════
 
-        // First inline entry.
-        if entry_offset != 0 {
-            results.push(self.read_entry_at(file, entry_offset)?);
+    /// Read a full journal entry at the given offset.
+    pub fn read_entry_at(&mut self, entry_offset: u64) -> Result<JournalEntry> {
+        let (_, obj_size) = self.move_to_object(ObjectType::Entry, entry_offset)?;
+
+        let seqnum = self.read_u64_at(entry_offset + 16)?;
+        let realtime = self.read_u64_at(entry_offset + 24)?;
+        let monotonic = self.read_u64_at(entry_offset + 32)?;
+        let boot_id_bytes = self.read_bytes_at(entry_offset + 40, 16)?;
+        let mut boot_id = [0u8; 16];
+        boot_id.copy_from_slice(&boot_id_bytes);
+
+        let item_sz = entry_item_size(self.compact);
+        let items_bytes = obj_size.saturating_sub(ENTRY_OBJECT_HEADER_SIZE as u64);
+        let n_items = items_bytes / item_sz;
+
+        let mut fields = Vec::with_capacity(n_items as usize);
+        for i in 0..n_items {
+            let data_off = self.entry_item_object_offset(entry_offset, i)?;
+            if data_off == 0 {
+                continue;
+            }
+            match self.read_data_payload(data_off) {
+                Ok(field) => fields.push(field),
+                Err(ref e) if Self::is_corruption_error(e) => continue, // skip corrupt
+                Err(e) => return Err(e), // propagate I/O errors
+            }
         }
 
-        // Remaining entries via the entry-array chain.
-        let mut arr_off = entry_array_offset;
-        let mut seen = 1u64;
-        while arr_off != 0 && seen < n_entries {
-            file.seek(SeekFrom::Start(arr_off))?;
-            let mut hdr_buf = [0u8; ENTRY_ARRAY_OBJECT_HEADER_SIZE];
-            file.read_exact(&mut hdr_buf)?;
-            let hdr: EntryArrayObjectHeader = unsafe {
-                std::ptr::read_unaligned(hdr_buf.as_ptr() as *const EntryArrayObjectHeader)
-            };
-            let obj_size   = from_le64(&hdr.object.size);
-            let next_arr   = from_le64(&hdr.next_entry_array_offset);
-            // Compact mode uses 4-byte (le32) items; regular mode uses 8-byte (le64).
-            let item_size  = if self.compact { 4u64 } else { 8u64 };
-            let n_items    = (obj_size.saturating_sub(ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64)) / item_size;
-            let items_base = arr_off + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64;
+        Ok(JournalEntry {
+            seqnum,
+            realtime,
+            monotonic,
+            boot_id,
+            fields,
+        })
+    }
 
-            for slot in 0..n_items {
-                if seen >= n_entries {
+    // ══════════════════════════════════════════════════════════════════════
+    // Chain cache
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:2671-2710 chain_cache_put
+    fn chain_cache_put(
+        &mut self,
+        first: u64,
+        array: u64,
+        begin: u64,
+        total: u64,
+        last_index: u64,
+    ) {
+        // Don't cache if array == first (first array in chain, not worth caching)
+        if !self.chain_cache.contains_key(&first) && array == first {
+            return;
+        }
+
+        // Evict oldest (insertion-order FIFO, matching systemd's ordered_hashmap_steal_first)
+        if !self.chain_cache.contains_key(&first) && self.chain_cache.len() >= CHAIN_CACHE_MAX {
+            self.chain_cache.shift_remove_index(0);
+        }
+
+        self.chain_cache.insert(
+            first,
+            ChainCacheItem {
+                first,
+                array,
+                begin,
+                total,
+                last_index,
+            },
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Array helpers
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:2712-2730 bump_array_index
+    fn bump_array_index(i: &mut u64, direction: Direction, n: u64) -> bool {
+        match direction {
+            Direction::Down => {
+                if *i >= n - 1 {
+                    return false;
+                }
+                *i += 1;
+            }
+            Direction::Up => {
+                if *i == 0 {
+                    return false;
+                }
+                *i -= 1;
+            }
+        }
+        true
+    }
+
+    /// systemd: journal-file.c:2732-2778 bump_entry_array
+    ///
+    /// Navigate to the next (Down) or previous (Up) entry array in the chain.
+    fn bump_entry_array(
+        &mut self,
+        arr_offset: u64,
+        first: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        match direction {
+            Direction::Down => {
+                // Read next_entry_array_offset from current array
+                let next = self.read_u64_at(arr_offset + OBJECT_HEADER_SIZE as u64)?;
+                Ok(if next > 0 { Some(next) } else { None })
+            }
+            Direction::Up => {
+                // Singly linked — walk from first to find predecessor of arr_offset
+                let mut p = first;
+                let mut q = 0u64;
+                while p > 0 && p != arr_offset {
+                    let (_, _) = self.move_to_object(ObjectType::EntryArray, p)?;
+                    q = p;
+                    p = self.read_u64_at(p + OBJECT_HEADER_SIZE as u64)?;
+                }
+                if p == 0 {
+                    return Err(Error::CorruptObject {
+                        offset: arr_offset,
+                        reason: "could not find previous entry array in chain".into(),
+                    });
+                }
+                Ok(if q > 0 { Some(q) } else { None })
+            }
+        }
+    }
+
+    /// systemd: journal-file.c:3524-3534 check_properly_ordered
+    fn check_properly_ordered(new_offset: u64, old_offset: u64, direction: Direction) -> bool {
+        if old_offset == 0 || new_offset == 0 {
+            return false;
+        }
+        match direction {
+            Direction::Down => new_offset > old_offset,
+            Direction::Up => new_offset < old_offset,
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // generic_array_get
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:2780-2901 generic_array_get
+    ///
+    /// Get the entry at index `i` in the entry array chain starting at `first`.
+    /// Handles corruption by skipping bad entries in the given direction.
+    pub fn generic_array_get(
+        &mut self,
+        first: u64,
+        mut i: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        let mut a = first;
+        let mut t: u64 = 0;
+        let mut k: u64 = 0;
+
+        // Try chain cache
+        if let Some(ci) = self.chain_cache.get(&first).cloned() {
+            if i > ci.total {
+                a = ci.array;
+                i -= ci.total;
+                t = ci.total;
+            }
+        }
+
+        // Walk to the array containing index i
+        while a > 0 {
+            match self.move_to_object(ObjectType::EntryArray, a) {
+                Ok((_, obj_size)) => {
+                    k = entry_array_n_items(obj_size, self.compact);
+                    if k == 0 {
+                        return Ok(None);
+                    }
+                    if i < k {
+                        break;
+                    }
+                    i -= k;
+                    t += k;
+                    a = self.read_u64_at(a + OBJECT_HEADER_SIZE as u64)?;
+                }
+                Err(ref e) if Self::is_corruption_error(e) => {
+                    // systemd: IN_SET(r, -EBADMSG, -EADDRNOTAVAIL)
+                    if direction == Direction::Down {
+                        return Ok(None);
+                    }
+                    i = u64::MAX;
                     break;
                 }
-                // Seek to the slot explicitly — read_entry_at will move the file pointer.
-                file.seek(SeekFrom::Start(items_base + slot * item_size))?;
-                let eoff = if self.compact {
-                    let mut buf = [0u8; 4];
-                    file.read_exact(&mut buf)?;
-                    u32::from_le_bytes(buf) as u64
-                } else {
-                    let mut buf = [0u8; 8];
-                    file.read_exact(&mut buf)?;
-                    u64::from_le_bytes(buf)
-                };
-                if eoff != 0 {
-                    results.push(self.read_entry_at(file, eoff)?);
-                    seen += 1;
+                Err(e) => return Err(e), // propagate I/O errors
+            }
+        }
+
+        // Now find the first valid entry at or near index i
+        while a > 0 {
+            if i == u64::MAX {
+                match self.bump_entry_array(a, first, direction)? {
+                    None => return Ok(None),
+                    Some(prev) => {
+                        a = prev;
+                        let (_, obj_size) = self.move_to_object(ObjectType::EntryArray, a)?;
+                        k = entry_array_n_items(obj_size, self.compact);
+                        if k == 0 {
+                            break;
+                        }
+                        match direction {
+                            Direction::Down => i = 0,
+                            Direction::Up => {
+                                if t < k {
+                                    return Err(Error::CorruptObject {
+                                        offset: a,
+                                        reason: "chain cache broken".into(),
+                                    });
+                                }
+                                i = k - 1;
+                                t -= k;
+                            }
+                        }
+                    }
                 }
             }
-            arr_off = next_arr;
+
+            loop {
+                let p = self.entry_array_item(a, i)?;
+                match self.move_to_object(ObjectType::Entry, p) {
+                    Ok(_) => {
+                        // Cache this position
+                        let begin = self.entry_array_item(a, 0)?;
+                        self.chain_cache_put(first, a, begin, t, i);
+                        return Ok(Some(p));
+                    }
+                    Err(ref e) if Self::is_corruption_error(e) => {
+                        // Corrupt entry, skip
+                        if !Self::bump_array_index(&mut i, direction, k) {
+                            break;
+                        }
+                    }
+                    Err(e) => return Err(e), // propagate I/O errors
+                }
+            }
+
+            // All entries in this array were corrupt, move to next/prev
+            if direction == Direction::Down {
+                t += k;
+            }
+            i = u64::MAX;
+        }
+
+        Ok(None)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Test callbacks for bisection
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:3321-3333 test_object_offset
+    fn test_object_offset(&self, p: u64, needle: u64) -> Result<i32> {
+        if p == 0 {
+            return Err(Error::CorruptObject {
+                offset: 0,
+                reason: "null offset in test_object_offset".into(),
+            });
+        }
+        if p == needle {
+            Ok(TEST_FOUND)
+        } else if p < needle {
+            Ok(TEST_LEFT)
+        } else {
+            Ok(TEST_RIGHT)
+        }
+    }
+
+    /// systemd: journal-file.c:3355-3373 test_object_seqnum
+    fn test_object_seqnum(&mut self, p: u64, needle: u64) -> Result<i32> {
+        let (_, _) = self.move_to_object(ObjectType::Entry, p)?;
+        let sq = self.read_u64_at(p + 16)?; // entry.seqnum
+        if sq == needle {
+            Ok(TEST_FOUND)
+        } else if sq < needle {
+            Ok(TEST_LEFT)
+        } else {
+            Ok(TEST_RIGHT)
+        }
+    }
+
+    /// systemd: journal-file.c:3395-3413 test_object_realtime
+    fn test_object_realtime(&mut self, p: u64, needle: u64) -> Result<i32> {
+        let (_, _) = self.move_to_object(ObjectType::Entry, p)?;
+        let rt = self.read_u64_at(p + 24)?; // entry.realtime
+        if rt == needle {
+            Ok(TEST_FOUND)
+        } else if rt < needle {
+            Ok(TEST_LEFT)
+        } else {
+            Ok(TEST_RIGHT)
+        }
+    }
+
+    /// systemd: journal-file.c:3435-3453 test_object_monotonic
+    fn test_object_monotonic(&mut self, p: u64, needle: u64) -> Result<i32> {
+        let (_, _) = self.move_to_object(ObjectType::Entry, p)?;
+        let m = self.read_u64_at(p + 32)?; // entry.monotonic
+        if m == needle {
+            Ok(TEST_FOUND)
+        } else if m < needle {
+            Ok(TEST_LEFT)
+        } else {
+            Ok(TEST_RIGHT)
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // generic_array_bisect_step
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:2913-2998 generic_array_bisect_step
+    ///
+    /// Test the entry at index `i` in `arr_offset` against `needle`.
+    /// Adjusts `left`/`right`/`m` boundaries.
+    /// Returns TEST_RIGHT, TEST_LEFT, TEST_GOTO_NEXT, TEST_GOTO_PREVIOUS.
+    fn generic_array_bisect_step(
+        &mut self,
+        arr_offset: u64,
+        i: u64,
+        needle: u64,
+        test_fn: &dyn Fn(&mut Self, u64, u64) -> Result<i32>,
+        direction: Direction,
+        m: &mut u64,
+        left: &mut u64,
+        right: &mut u64,
+    ) -> Result<i32> {
+        let p = self.entry_array_item(arr_offset, i)?;
+        let r = if p == 0 {
+            Err(Error::CorruptObject {
+                offset: arr_offset,
+                reason: "null entry in array".into(),
+            })
+        } else {
+            test_fn(self, p, needle)
+        };
+
+        let r = match r {
+            Err(ref e) if Self::is_corruption_error(e) => {
+                // systemd: IN_SET(r, -EBADMSG, -EADDRNOTAVAIL) — corruption only
+                if i == *left {
+                    return Ok(TEST_GOTO_PREVIOUS);
+                }
+                *m = i;
+                *right = i - 1;
+                return Ok(TEST_RIGHT);
+            }
+            Err(e) => return Err(e), // propagate I/O errors
+            Ok(v) => v,
+        };
+
+        // If FOUND, treat as RIGHT (for DOWN) or LEFT (for UP) to find first/last match
+        let r = if r == TEST_FOUND {
+            if direction == Direction::Down {
+                TEST_RIGHT
+            } else {
+                TEST_LEFT
+            }
+        } else {
+            r
+        };
+
+        if r == TEST_RIGHT {
+            if direction == Direction::Down {
+                *right = i;
+            } else {
+                if i == 0 {
+                    return Ok(TEST_GOTO_PREVIOUS);
+                }
+                *right = i - 1;
+            }
+        } else {
+            // TEST_LEFT
+            if direction == Direction::Down {
+                if i == *m - 1 {
+                    return Ok(TEST_GOTO_NEXT);
+                }
+                *left = i + 1;
+            } else {
+                *left = i;
+            }
+        }
+
+        Ok(r)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // generic_array_bisect
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:3000-3234 generic_array_bisect
+    ///
+    /// Binary search the entry array chain for the entry closest to `needle`.
+    /// Returns (entry_offset, index_from_chain_start) or None if not found.
+    pub fn generic_array_bisect(
+        &mut self,
+        first: u64,
+        mut n: u64,
+        needle: u64,
+        test_fn: &dyn Fn(&mut Self, u64, u64) -> Result<i32>,
+        direction: Direction,
+    ) -> Result<Option<(u64, u64)>> {
+        if n == 0 {
+            return Ok(None);
+        }
+
+        let mut a = first;
+        let mut t: u64 = 0;
+        let mut last_index = u64::MAX;
+
+        // Try chain cache
+        if let Some(ci) = self.chain_cache.get(&first).cloned() {
+            if n > ci.total && ci.begin != 0 {
+                match test_fn(self, ci.begin, needle) {
+                    Ok(TEST_LEFT) => {
+                        a = ci.array;
+                        n -= ci.total;
+                        t = ci.total;
+                        last_index = ci.last_index;
+                    }
+                    // systemd: IN_SET(r, -EBADMSG, -EADDRNOTAVAIL) — ignore corruption
+                    Err(ref e) if Self::is_corruption_error(e) => {}
+                    Err(e) => return Err(e), // propagate I/O errors
+                    _ => {}
+                }
+            }
+        }
+
+        while a > 0 {
+            let (_, obj_size) = self.move_to_object(ObjectType::EntryArray, a)?;
+            let k = entry_array_n_items(obj_size, self.compact);
+            let mut m = k.min(n);
+            let m_original = m;
+            if m == 0 {
+                return Ok(None);
+            }
+
+            let mut left: u64 = 0;
+            let mut right: u64 = m - 1;
+
+            // For UP direction, test first element to see if we should go to previous array
+            if direction == Direction::Up && left < right {
+                let r = self.generic_array_bisect_step(
+                    a, 0, needle, test_fn, direction, &mut m, &mut left, &mut right,
+                )?;
+                if r == TEST_GOTO_PREVIOUS {
+                    return self.bisect_goto_previous(a, first, t, direction);
+                }
+            }
+
+            // Test last element
+            let r = self.generic_array_bisect_step(
+                a, right, needle, test_fn, direction, &mut m, &mut left, &mut right,
+            )?;
+            if r == TEST_GOTO_PREVIOUS {
+                return self.bisect_goto_previous(a, first, t, direction);
+            }
+
+            if r == TEST_RIGHT {
+                // Needle is in this array — bisect
+
+                // Try near last_index first for locality
+                if last_index > 0 && left < last_index - 1 && last_index - 1 < right {
+                    let r = self.generic_array_bisect_step(
+                        a,
+                        last_index - 1,
+                        needle,
+                        test_fn,
+                        direction,
+                        &mut m,
+                        &mut left,
+                        &mut right,
+                    )?;
+                    if r == TEST_GOTO_PREVIOUS {
+                        return self.bisect_goto_previous(a, first, t, direction);
+                    }
+                }
+                if last_index < u64::MAX && left < last_index + 1 && last_index + 1 < right {
+                    let r = self.generic_array_bisect_step(
+                        a,
+                        last_index + 1,
+                        needle,
+                        test_fn,
+                        direction,
+                        &mut m,
+                        &mut left,
+                        &mut right,
+                    )?;
+                    if r == TEST_GOTO_PREVIOUS {
+                        return self.bisect_goto_previous(a, first, t, direction);
+                    }
+                }
+
+                // Main bisection loop
+                loop {
+                    if left == right {
+                        if m != m_original && direction == Direction::Down {
+                            let r = self.generic_array_bisect_step(
+                                a, left, needle, test_fn, direction, &mut m, &mut left, &mut right,
+                            )?;
+                            if r == TEST_GOTO_PREVIOUS || r == TEST_GOTO_NEXT {
+                                return Ok(None);
+                            }
+                        }
+                        // Found
+                        return self.bisect_found(a, first, left, t);
+                    }
+
+                    let i = (left + right + if direction == Direction::Up { 1 } else { 0 }) / 2;
+
+                    let r = self.generic_array_bisect_step(
+                        a, i, needle, test_fn, direction, &mut m, &mut left, &mut right,
+                    )?;
+                    if r == TEST_GOTO_PREVIOUS {
+                        return self.bisect_goto_previous(a, first, t, direction);
+                    }
+                    if r == TEST_GOTO_NEXT {
+                        return Ok(None);
+                    }
+                }
+            }
+
+            // Not in this array, go to next
+            if k >= n {
+                if direction == Direction::Up {
+                    let i = n - 1;
+                    return self.bisect_found(a, first, i, t);
+                }
+                return Ok(None);
+            }
+
+            n -= k;
+            t += k;
+            last_index = u64::MAX;
+            a = self.read_u64_at(a + OBJECT_HEADER_SIZE as u64)?;
+        }
+
+        Ok(None)
+    }
+
+    /// Helper: return found result from bisection.
+    fn bisect_found(
+        &mut self,
+        arr_offset: u64,
+        first: u64,
+        i: u64,
+        t: u64,
+    ) -> Result<Option<(u64, u64)>> {
+        // Cache
+        let begin = self.entry_array_item(arr_offset, 0)?;
+        self.chain_cache_put(first, arr_offset, begin, t, i);
+
+        let p = self.entry_array_item(arr_offset, i)?;
+        if p == 0 {
+            return Err(Error::CorruptObject {
+                offset: arr_offset,
+                reason: "null entry at bisection result".into(),
+            });
+        }
+
+        // Validate it's an entry
+        let _ = self.move_to_object(ObjectType::Entry, p)?;
+
+        Ok(Some((p, t + i)))
+    }
+
+    /// Helper: handle TEST_GOTO_PREVIOUS from bisection.
+    /// systemd: journal-file.c:3197-3218 (the `previous:` label)
+    fn bisect_goto_previous(
+        &mut self,
+        arr_offset: u64,
+        first: u64,
+        t: u64,
+        direction: Direction,
+    ) -> Result<Option<(u64, u64)>> {
+        // The current array is the first in the chain — no previous array
+        if t == 0 {
+            return Ok(None);
+        }
+
+        // systemd: journal-file.c:3190-3191
+        // When going downward, there is no matching entry in the previous array.
+        if direction == Direction::Down {
+            return Ok(None);
+        }
+
+        // Get the last entry of the previous array
+        let prev_a = match self.bump_entry_array(arr_offset, first, Direction::Up)? {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+
+        let (_, prev_obj_size) = self.move_to_object(ObjectType::EntryArray, prev_a)?;
+        let prev_k = entry_array_n_items(prev_obj_size, self.compact);
+        if prev_k == 0 || t < prev_k {
+            return Err(Error::CorruptObject {
+                offset: prev_a,
+                reason: "chain total inconsistent with previous array size".into(),
+            });
+        }
+
+        let new_t = t - prev_k;
+        let i = prev_k - 1;
+
+        self.bisect_found(prev_a, first, i, new_t)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // generic_array_bisect_for_data (plus_one variant)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:3236-3319 generic_array_bisect_for_data
+    ///
+    /// Like generic_array_bisect but handles the extra inline entry in DATA objects.
+    pub fn generic_array_bisect_for_data(
+        &mut self,
+        data_offset: u64,
+        needle: u64,
+        test_fn: &dyn Fn(&mut Self, u64, u64) -> Result<i32>,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        let (_, _) = self.move_to_object(ObjectType::Data, data_offset)?;
+
+        let mut n = self.read_u64_at(data_offset + 56)?; // n_entries
+        if n == 0 {
+            return Ok(None);
+        }
+        n -= 1; // subtract the inline entry
+
+        let extra = self.read_u64_at(data_offset + 40)?; // entry_offset (inline)
+        let first = self.read_u64_at(data_offset + 48)?; // entry_array_offset
+
+        // Test the extra (inline) entry
+        let r = test_fn(self, extra, needle)?;
+
+        if direction == Direction::Down {
+            if r == TEST_FOUND || r == TEST_RIGHT {
+                // Extra is the answer
+                let _ = self.move_to_object(ObjectType::Entry, extra)?;
+                return Ok(Some(extra));
+            }
+        } else {
+            // Direction::Up
+            if r == TEST_RIGHT {
+                return Ok(None); // All entries are before needle
+            }
+        }
+
+        // Search the array chain
+        if let Some((p, _)) = self.generic_array_bisect(first, n, needle, test_fn, direction)? {
+            return Ok(Some(p));
+        }
+
+        // Nothing found in chain; for UP, use the extra
+        if direction == Direction::Up {
+            let _ = self.move_to_object(ObjectType::Entry, extra)?;
+            return Ok(Some(extra));
+        }
+
+        Ok(None)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Entry navigation
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:3536-3605 journal_file_next_entry
+    ///
+    /// Given `p` (current entry offset, 0 for first/last), move to the
+    /// next (Down) or previous (Up) entry.
+    pub fn next_entry(
+        &mut self,
+        p: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        if self.n_entries == 0 {
+            return Ok(None);
+        }
+
+        if p == 0 {
+            // Return first or last entry
+            let idx = if direction == Direction::Down {
+                0
+            } else {
+                self.n_entries - 1
+            };
+            return self.generic_array_get(self.entry_array_offset, idx, direction);
+        }
+
+        // Find current position via bisection
+        let test_offset = |s: &mut Self, entry_p: u64, needle: u64| -> Result<i32> {
+            s.test_object_offset(entry_p, needle)
+        };
+
+        let result = self.generic_array_bisect(
+            self.entry_array_offset,
+            self.n_entries,
+            p,
+            &test_offset,
+            direction,
+        )?;
+
+        let (q, mut i) = match result {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        if p == q {
+            // Found exact match — move one step
+            if !Self::bump_array_index(&mut i, direction, self.n_entries) {
+                return Ok(None);
+            }
+        }
+
+        let result = self.generic_array_get(self.entry_array_offset, i, direction)?;
+
+        if let Some(new_offset) = result {
+            if !Self::check_properly_ordered(new_offset, p, direction) {
+                return Err(Error::CorruptObject {
+                    offset: new_offset,
+                    reason: "entry array not properly ordered".into(),
+                });
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// systemd: journal-file.c:3335-3353 journal_file_move_to_entry_by_offset
+    pub fn move_to_entry_by_offset(
+        &mut self,
+        p: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        let test_offset = |s: &mut Self, entry_p: u64, needle: u64| -> Result<i32> {
+            s.test_object_offset(entry_p, needle)
+        };
+        Ok(self
+            .generic_array_bisect(
+                self.entry_array_offset,
+                self.n_entries,
+                p,
+                &test_offset,
+                direction,
+            )?
+            .map(|(off, _)| off))
+    }
+
+    /// systemd: journal-file.c:3375-3393 journal_file_move_to_entry_by_seqnum
+    pub fn move_to_entry_by_seqnum(
+        &mut self,
+        seqnum: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        let test_seqnum = |s: &mut Self, p: u64, needle: u64| -> Result<i32> {
+            s.test_object_seqnum(p, needle)
+        };
+        Ok(self
+            .generic_array_bisect(
+                self.entry_array_offset,
+                self.n_entries,
+                seqnum,
+                &test_seqnum,
+                direction,
+            )?
+            .map(|(off, _)| off))
+    }
+
+    /// systemd: journal-file.c:3415-3433 journal_file_move_to_entry_by_realtime
+    pub fn move_to_entry_by_realtime(
+        &mut self,
+        realtime: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        let test_realtime = |s: &mut Self, p: u64, needle: u64| -> Result<i32> {
+            s.test_object_realtime(p, needle)
+        };
+        Ok(self
+            .generic_array_bisect(
+                self.entry_array_offset,
+                self.n_entries,
+                realtime,
+                &test_realtime,
+                direction,
+            )?
+            .map(|(off, _)| off))
+    }
+
+    /// systemd: journal-file.c:3469-3493 journal_file_move_to_entry_by_monotonic
+    pub fn move_to_entry_by_monotonic(
+        &mut self,
+        boot_id: &[u8; 16],
+        monotonic: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        // Find the _BOOT_ID= data object
+        // systemd: journal-file.c:3455-3467 find_data_object_by_boot_id
+        let boot_id_hex = boot_id
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        let boot_data = format!("_BOOT_ID={}", boot_id_hex);
+        let data_offset = match self.find_data_object(boot_data.as_bytes())? {
+            Some(off) => off,
+            None => return Ok(None),
+        };
+
+        let test_monotonic = |s: &mut Self, p: u64, needle: u64| -> Result<i32> {
+            s.test_object_monotonic(p, needle)
+        };
+
+        self.generic_array_bisect_for_data(data_offset, monotonic, &test_monotonic, direction)
+    }
+
+    /// systemd: journal-file.c:3607-3672 journal_file_move_to_entry_for_data
+    ///
+    /// Get the first (Down) or last (Up) entry linked to a specific DATA object.
+    pub fn move_to_entry_for_data(
+        &mut self,
+        data_offset: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        let (_, _) = self.move_to_object(ObjectType::Data, data_offset)?;
+
+        let mut n = self.read_u64_at(data_offset + 56)?; // n_entries
+        if n == 0 {
+            return Ok(None);
+        }
+        n -= 1;
+
+        let extra = self.read_u64_at(data_offset + 40)?; // entry_offset
+        let first = self.read_u64_at(data_offset + 48)?; // entry_array_offset
+
+        if direction == Direction::Down && extra > 0 {
+            match self.move_to_object(ObjectType::Entry, extra) {
+                Ok(_) => return Ok(Some(extra)),
+                Err(ref e) if Self::is_corruption_error(e) => {} // fall through to array
+                Err(e) => return Err(e),
+            }
+        }
+
+        if n > 0 {
+            let idx = if direction == Direction::Down { 0 } else { n - 1 };
+            match self.generic_array_get(first, idx, direction) {
+                Ok(Some(p)) => return Ok(Some(p)),
+                Ok(None) => {}
+                Err(ref e) if Self::is_corruption_error(e) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if direction == Direction::Up && extra > 0 {
+            match self.move_to_object(ObjectType::Entry, extra) {
+                Ok(_) => return Ok(Some(extra)),
+                Err(ref e) if Self::is_corruption_error(e) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(None)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Public convenience iterators
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Return an iterator over all entries in chronological order.
+    pub fn entries(&mut self) -> Result<Vec<JournalEntry>> {
+        let mut results = Vec::new();
+        let mut p = 0u64;
+
+        loop {
+            match self.next_entry(p, Direction::Down)? {
+                Some(offset) => {
+                    let entry = self.read_entry_at(offset)?;
+                    results.push(entry);
+                    p = offset;
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Look up all entries that contain a specific `field=value` pair.
+    pub fn entries_for_field<N: AsRef<[u8]>, V: AsRef<[u8]>>(
+        &mut self,
+        name: N,
+        value: V,
+    ) -> Result<Vec<JournalEntry>> {
+        let name = name.as_ref();
+        let value = value.as_ref();
+
+        let mut payload = Vec::with_capacity(name.len() + 1 + value.len());
+        payload.extend_from_slice(name);
+        payload.push(b'=');
+        payload.extend_from_slice(value);
+
+        let data_offset = match self.find_data_object(&payload)? {
+            Some(off) => off,
+            None => return Ok(vec![]),
+        };
+
+        // Collect all entries linked to this DATA object
+        let n_entries = self.read_u64_at(data_offset + 56)?;
+        let entry_offset = self.read_u64_at(data_offset + 40)?;
+        let entry_array_offset = self.read_u64_at(data_offset + 48)?;
+
+        let mut results = Vec::new();
+
+        // First inline entry
+        if entry_offset != 0 {
+            match self.read_entry_at(entry_offset) {
+                Ok(e) => results.push(e),
+                Err(ref e) if Self::is_corruption_error(e) => {} // skip corrupt
+                Err(e) => return Err(e), // propagate I/O errors
+            }
+        }
+
+        // Walk entry array chain
+        if n_entries > 1 {
+            let mut arr_off = entry_array_offset;
+            let mut seen = 1u64;
+            while arr_off != 0 && seen < n_entries {
+                let (_, obj_size) = self.move_to_object(ObjectType::EntryArray, arr_off)?;
+                let item_sz = entry_array_item_size(self.compact);
+                let n_items = entry_array_n_items(obj_size, self.compact);
+                let next = self.read_u64_at(arr_off + OBJECT_HEADER_SIZE as u64)?;
+
+                for slot in 0..n_items {
+                    if seen >= n_entries {
+                        break;
+                    }
+                    let eoff = self.entry_array_item(arr_off, slot)?;
+                    if eoff != 0 {
+                        match self.read_entry_at(eoff) {
+                            Ok(e) => results.push(e),
+                            Err(ref e) if Self::is_corruption_error(e) => {} // skip corrupt
+                Err(e) => return Err(e), // propagate I/O errors
+                        }
+                        seen += 1;
+                    }
+                }
+                arr_off = next;
+            }
         }
 
         Ok(results)
     }
 }
 
-// ── Entry iterator ─────────────────────────────────────────────────────────
-
-/// An iterator over all journal entries in a file, in order.
-pub struct EntryIter<'a> {
-    reader: &'a JournalReader,
-    file: File,
-    current_array_offset: u64,
-    current_array_index: u64,
-    done: bool,
-}
-
-impl<'a> Iterator for EntryIter<'a> {
-    type Item = Result<JournalEntry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        loop {
-            if self.current_array_offset == 0 {
-                self.done = true;
-                return None;
-            }
-
-            // Read the entry-array object header.
-            match self.file.seek(SeekFrom::Start(self.current_array_offset)) {
-                Err(e) => return Some(Err(e.into())),
-                Ok(_) => {}
-            }
-            let mut hdr_buf = [0u8; ENTRY_ARRAY_OBJECT_HEADER_SIZE];
-            if self.file.read_exact(&mut hdr_buf).is_err() {
-                self.done = true;
-                return None;
-            }
-            let hdr: EntryArrayObjectHeader = unsafe {
-                std::ptr::read_unaligned(hdr_buf.as_ptr() as *const EntryArrayObjectHeader)
-            };
-
-            let obj_size  = from_le64(&hdr.object.size);
-            let item_size = if self.reader.compact { 4u64 } else { 8u64 };
-            let n_items   = (obj_size.saturating_sub(ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64)) / item_size;
-            let next_arr  = from_le64(&hdr.next_entry_array_offset);
-
-            if self.current_array_index >= n_items {
-                // Move to next array.
-                self.current_array_offset = next_arr;
-                self.current_array_index  = 0;
-                if next_arr == 0 {
-                    self.done = true;
-                    return None;
-                }
-                continue;
-            }
-
-            // Seek to the slot.
-            let item_size = if self.reader.compact { 4u64 } else { 8u64 };
-            let slot_off = self.current_array_offset
-                + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64
-                + self.current_array_index * item_size;
-            if self.file.seek(SeekFrom::Start(slot_off)).is_err() {
-                self.done = true;
-                return None;
-            }
-            let entry_off = if self.reader.compact {
-                let mut buf = [0u8; 4];
-                if self.file.read_exact(&mut buf).is_err() {
-                    self.done = true;
-                    return None;
-                }
-                u32::from_le_bytes(buf) as u64
-            } else {
-                let mut buf = [0u8; 8];
-                if self.file.read_exact(&mut buf).is_err() {
-                    self.done = true;
-                    return None;
-                }
-                u64::from_le_bytes(buf)
-            };
-            self.current_array_index += 1;
-
-            if entry_off == 0 {
-                // Sparse slot — check for end-of-array.
-                if self.current_array_index >= n_items {
-                    self.current_array_offset = next_arr;
-                    self.current_array_index  = 0;
-                }
-                continue;
-            }
-
-            return Some(self.reader.read_entry_at(&mut self.file, entry_off));
-        }
-    }
-}
-
-// ── Free-standing file I/O helpers ────────────────────────────────────────
-
-fn read_hash_item_from(file: &mut File, offset: u64) -> Result<HashItem> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut buf = [0u8; HASH_ITEM_SIZE];
-    file.read_exact(&mut buf)?;
-    Ok(unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const HashItem) })
-}
-
-/// Read the metadata fields of a DATA object needed for hash-chain walking.
-/// Returns (hash, next_hash_offset, payload, entry_offset, entry_array_offset, n_entries).
-fn read_data_object_meta(file: &mut File, offset: u64, compact: bool) -> Result<(u64, u64, Vec<u8>, u64, u64, u64)> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut hdr_buf = [0u8; DATA_OBJECT_HEADER_SIZE];
-    file.read_exact(&mut hdr_buf)?;
-    let hdr: DataObjectHeader =
-        unsafe { std::ptr::read_unaligned(hdr_buf.as_ptr() as *const DataObjectHeader) };
-
-    let h             = from_le64(&hdr.hash);
-    let next          = from_le64(&hdr.next_hash_offset);
-    let entry_offset  = from_le64(&hdr.entry_offset);
-    let entry_arr_off = from_le64(&hdr.entry_array_offset);
-    let n_entries     = from_le64(&hdr.n_entries);
-    let obj_size      = from_le64(&hdr.object.size);
-
-    // Compact mode adds 8 bytes (tail_entry_array_offset + tail_entry_array_n_entries) before payload.
-    let payload_base = if compact {
-        DATA_OBJECT_HEADER_SIZE as u64 + 8
-    } else {
-        DATA_OBJECT_HEADER_SIZE as u64
-    };
-    let payload_len = obj_size.saturating_sub(payload_base);
-
-    if compact {
-        use std::io::Seek;
-        file.seek(SeekFrom::Current(8))?;
-    }
-
-    let mut payload = vec![0u8; payload_len as usize];
-    file.read_exact(&mut payload)?;
-
-    Ok((h, next, payload, entry_offset, entry_arr_off, n_entries))
-}
+// ══════════════════════════════════════════════════════════════════════════
+// Tests
+// ══════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
@@ -531,17 +1417,19 @@ mod tests {
             w.append_entry(&[
                 ("MESSAGE", b"First entry" as &[u8]),
                 ("PRIORITY", b"6"),
-            ]).unwrap();
+            ])
+            .unwrap();
             w.append_entry(&[
                 ("MESSAGE", b"Second entry" as &[u8]),
                 ("PRIORITY", b"5"),
                 ("SYSLOG_IDENTIFIER", b"qtest"),
-            ]).unwrap();
+            ])
+            .unwrap();
             w.flush().unwrap();
         }
 
-        let reader = JournalReader::open(&path).unwrap();
-        let entries: Vec<_> = reader.entries().collect::<Result<_>>().unwrap();
+        let mut reader = JournalReader::open(&path).unwrap();
+        let entries = reader.entries().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].message(), Some("First entry"));
         assert_eq!(entries[1].message(), Some("Second entry"));
@@ -558,14 +1446,107 @@ mod tests {
 
         {
             let mut w = JournalWriter::open(&path).unwrap();
-            w.append_entry(&[("MESSAGE", b"match" as &[u8]), ("PRIORITY", b"6")]).unwrap();
-            w.append_entry(&[("MESSAGE", b"nomatch" as &[u8]), ("PRIORITY", b"3")]).unwrap();
+            w.append_entry(&[("MESSAGE", b"match" as &[u8]), ("PRIORITY", b"6")])
+                .unwrap();
+            w.append_entry(&[("MESSAGE", b"nomatch" as &[u8]), ("PRIORITY", b"3")])
+                .unwrap();
             w.flush().unwrap();
         }
 
-        let reader = JournalReader::open(&path).unwrap();
+        let mut reader = JournalReader::open(&path).unwrap();
         let matches = reader.entries_for_field("PRIORITY", b"6").unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].message(), Some("match"));
+    }
+
+    #[test]
+    fn test_next_entry_navigation() {
+        let path = tmp_path("qjournal_next_entry.journal");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut w = JournalWriter::open(&path).unwrap();
+            for i in 0..10 {
+                let msg = format!("entry {}", i);
+                w.append_entry(&[("MESSAGE", msg.as_bytes())]).unwrap();
+            }
+            w.flush().unwrap();
+        }
+
+        let mut reader = JournalReader::open(&path).unwrap();
+
+        // Forward traversal
+        let mut p = 0u64;
+        let mut count = 0;
+        loop {
+            match reader.next_entry(p, Direction::Down).unwrap() {
+                Some(off) => {
+                    p = off;
+                    count += 1;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(count, 10);
+
+        // Backward traversal from last
+        let mut count_back = 0;
+        loop {
+            match reader.next_entry(p, Direction::Up).unwrap() {
+                Some(off) => {
+                    p = off;
+                    count_back += 1;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(count_back, 9); // 9 moves back from last = first
+    }
+
+    #[test]
+    fn test_move_to_entry_by_seqnum() {
+        let path = tmp_path("qjournal_seqnum_seek.journal");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut w = JournalWriter::open(&path).unwrap();
+            for i in 0..5 {
+                let msg = format!("entry {}", i);
+                w.append_entry(&[("MESSAGE", msg.as_bytes())]).unwrap();
+            }
+            w.flush().unwrap();
+        }
+
+        let mut reader = JournalReader::open(&path).unwrap();
+
+        // Find seqnum 3 (third entry)
+        let off = reader
+            .move_to_entry_by_seqnum(3, Direction::Down)
+            .unwrap();
+        assert!(off.is_some());
+        let entry = reader.read_entry_at(off.unwrap()).unwrap();
+        assert_eq!(entry.seqnum, 3);
+    }
+
+    #[test]
+    fn test_find_data_object() {
+        let path = tmp_path("qjournal_find_data.journal");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut w = JournalWriter::open(&path).unwrap();
+            w.append_entry(&[("MESSAGE", b"hello world" as &[u8])])
+                .unwrap();
+            w.flush().unwrap();
+        }
+
+        let mut reader = JournalReader::open(&path).unwrap();
+        let found = reader.find_data_object(b"MESSAGE=hello world").unwrap();
+        assert!(found.is_some());
+
+        let not_found = reader
+            .find_data_object(b"MESSAGE=does not exist")
+            .unwrap();
+        assert!(not_found.is_none());
     }
 }

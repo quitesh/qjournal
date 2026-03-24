@@ -17,6 +17,10 @@ libc = "0.2"
 memmap2 = "0.9"
 # UUID / ID128 generation for file_id, machine_id, seqnum_id, boot_id
 uuid = { version = "1", features = ["v4"] }
+# Ordered hashmap for chain cache (insertion-order LRU eviction, matching systemd's ordered_hashmap)
+indexmap = "2"
+# SipHash-2-4 for keyed hashing (systemd HEADER_INCOMPATIBLE_KEYED_HASH)
+siphasher = "1"
 # zstd compression (the format's preferred modern codec)
 zstd = { version = "0.13", optional = true }
 # thiserror for ergonomic error types

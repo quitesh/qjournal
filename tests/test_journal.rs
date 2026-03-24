@@ -18,9 +18,8 @@ fn test_empty_one() {
     drop(w1);
 
     // Verify it is readable
-    let r1 = JournalReader::open(&path);
-    assert!(r1.is_ok(), "Failed to open new journal file for reading");
-    let items: Vec<_> = r1.unwrap().entries().filter_map(Result::ok).collect();
+    let mut r1 = JournalReader::open(&path).expect("Failed to open for reading");
+    let items = r1.entries().unwrap();
     assert_eq!(items.len(), 0, "Expected empty journal");
 
     let _ = fs::remove_file(&path);
@@ -33,7 +32,7 @@ fn test_non_empty_one() {
 
     // Write a couple entries
     let mut writer = JournalWriter::open(&path).expect("Failed to open writer");
-    
+
     // seqnum 1
     writer.append_entry(&[
         ("TEST1", b"1" as &[u8])
@@ -52,15 +51,15 @@ fn test_non_empty_one() {
     writer.flush().unwrap();
     drop(writer);
 
-    let reader = JournalReader::open(&path).expect("Failed to open reader");
-    
+    let mut reader = JournalReader::open(&path).expect("Failed to open reader");
+
     // Test forward iteration
-    let entries: Vec<_> = reader.entries().collect::<Result<_, _>>().unwrap();
+    let entries = reader.entries().unwrap();
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].seqnum, 1);
     assert_eq!(entries[1].seqnum, 2);
     assert_eq!(entries[2].seqnum, 3);
-    
+
     // Ensure we can query fields
     let matches_test1 = reader.entries_for_field("TEST1", b"1").unwrap();
     assert_eq!(matches_test1.len(), 2);

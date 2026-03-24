@@ -49,10 +49,10 @@ pub mod incompat {
     pub const KEYED_HASH:      u32 = 1 << 2;
     pub const COMPRESSED_ZSTD: u32 = 1 << 3;
     pub const COMPACT:         u32 = 1 << 4;
-    /// Mask of flags we support when writing. We only use KEYED_HASH (siphash
-    /// would need a secret key; we fall back to jenkins) and COMPACT.
-    /// For now we write plain (non-compact) files with no compression.
-    pub const SUPPORTED_WRITE: u32 = 0;
+    /// Mask of flags we support when writing.
+    /// We support KEYED_HASH (siphash24 keyed with file_id).
+    pub const SUPPORTED_WRITE: u32 = KEYED_HASH;
+    /// Mask of flags we support when reading.
     pub const SUPPORTED_READ: u32  = COMPRESSED_ZSTD | KEYED_HASH | COMPACT;
 }
 
