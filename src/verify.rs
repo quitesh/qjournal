@@ -4,6 +4,11 @@
 //! Rust port of systemd's `journal-verify.c` (`journal_file_verify`).
 //! Walks all objects, verifies structural integrity, checks hash chains,
 //! entry ordering, and count consistency.
+//!
+//! Two-pass verification:
+//! 1. Sequential object walk -- validate each object individually, track offsets.
+//! 2. Cross-reference -- verify hash table chains, entry->data references,
+//!    data reachability from hash table, and entry array chain integrity.
 
 use std::{
     collections::HashSet,
@@ -16,8 +21,8 @@ use crate::{
     def::*,
     error::{Error, Result},
     writer::{
-        check_object, check_object_header, data_payload_offset, entry_array_item_size,
-        entry_array_n_items, entry_item_size, journal_file_hash_data, verify_header,
+        check_object_header, data_payload_offset, entry_array_item_size, entry_array_n_items,
+        entry_item_size, journal_file_hash_data, verify_header,
     },
 };
 
@@ -38,7 +43,11 @@ pub struct VerifyResult {
     pub warnings: Vec<String>,
 }
 
-// ── I/O helpers ─────────────────────────────────────────────────────────
+/// Upper bound for VALID_REALTIME/VALID_MONOTONIC/VALID_EPOCH checks.
+/// systemd: `(1ULL << 55)`
+const TIMESTAMP_UPPER: u64 = 1u64 << 55;
+
+// -- I/O helpers ----------------------------------------------------------
 
 fn read_u64_at(file: &mut File, offset: u64) -> Result<u64> {
     file.seek(SeekFrom::Start(offset))?;
@@ -61,7 +70,34 @@ fn read_bytes_at(file: &mut File, offset: u64, n: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-// ── Object-level verification ───────────────────────────────────────────
+/// Read an entry-array item (offset) at a given slot position.
+fn read_entry_array_item(file: &mut File, base: u64, index: u64, compact: bool) -> Result<u64> {
+    let item_sz = entry_array_item_size(compact);
+    let off = base + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + index * item_sz;
+    if compact {
+        Ok(read_u32_at(file, off)? as u64)
+    } else {
+        read_u64_at(file, off)
+    }
+}
+
+/// Read an entry item (data object offset) at a given slot position.
+fn read_entry_item_offset(
+    file: &mut File,
+    entry_off: u64,
+    index: u64,
+    compact: bool,
+) -> Result<u64> {
+    let item_sz = entry_item_size(compact);
+    let off = entry_off + ENTRY_OBJECT_HEADER_SIZE as u64 + index * item_sz;
+    if compact {
+        Ok(read_u32_at(file, off)? as u64)
+    } else {
+        read_u64_at(file, off)
+    }
+}
+
+// -- Object-level verification --------------------------------------------
 
 /// systemd: journal-verify.c:141-383 journal_file_object_verify
 ///
@@ -82,9 +118,23 @@ fn verify_object(
         reason: format!("invalid object type {}", obj_type),
     })?;
 
+    // systemd: journal-verify.c:150-156
+    // Reject compression flags on non-DATA objects
+    let compressed = obj_flags & obj_flags::COMPRESSED_MASK;
+    if compressed != 0 && otype != ObjectType::Data {
+        return Err(Error::CorruptObject {
+            offset,
+            reason: format!(
+                "non-DATA object {:?} has compression flags {:#x}",
+                otype, compressed
+            ),
+        });
+    }
+
     match otype {
         ObjectType::Data => {
-            // Verify hash matches payload
+            // systemd: journal-verify.c:158-203
+
             let payload_off = data_payload_offset(compact);
             if obj_size <= payload_off {
                 return Err(Error::CorruptObject {
@@ -94,17 +144,69 @@ fn verify_object(
             }
             let payload_len = (obj_size - payload_off) as usize;
 
+            // Read data object header fields for structural checks
+            let next_hash_offset = read_u64_at(file, offset + 24)?;
+            let next_field_offset = read_u64_at(file, offset + 32)?;
+            let entry_offset = read_u64_at(file, offset + 40)?;
+            let entry_array_offset = read_u64_at(file, offset + 48)?;
+            let n_entries = read_u64_at(file, offset + 56)?;
+
+            // systemd: journal-verify.c:167-169
+            // entry_offset == 0 XOR n_entries == 0 consistency
+            if (entry_offset == 0) != (n_entries == 0) {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "DATA entry_offset={:#x} but n_entries={}",
+                        entry_offset, n_entries
+                    ),
+                });
+            }
+
+            // systemd: journal-verify.c:191-201 VALID64 checks
+            if next_hash_offset != 0 && !valid64(next_hash_offset) {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "DATA next_hash_offset {:#x} not aligned",
+                        next_hash_offset
+                    ),
+                });
+            }
+            if next_field_offset != 0 && !valid64(next_field_offset) {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "DATA next_field_offset {:#x} not aligned",
+                        next_field_offset
+                    ),
+                });
+            }
+            if entry_offset != 0 && !valid64(entry_offset) {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!("DATA entry_offset {:#x} not aligned", entry_offset),
+                });
+            }
+            if entry_array_offset != 0 && !valid64(entry_array_offset) {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "DATA entry_array_offset {:#x} not aligned",
+                        entry_array_offset
+                    ),
+                });
+            }
+
             // Read payload (handle compression)
-            let compressed = obj_flags & obj_flags::COMPRESSED_MASK;
             let raw = read_bytes_at(file, offset + payload_off, payload_len)?;
             let payload = if compressed & obj_flags::COMPRESSED_ZSTD != 0 {
                 #[cfg(feature = "zstd-compression")]
                 {
-                    zstd::decode_all(raw.as_slice())
-                        .map_err(|e| Error::CorruptObject {
-                            offset,
-                            reason: format!("ZSTD decompression failed during verify: {}", e),
-                        })?
+                    zstd::decode_all(raw.as_slice()).map_err(|e| Error::CorruptObject {
+                        offset,
+                        reason: format!("ZSTD decompression failed during verify: {}", e),
+                    })?
                 }
                 #[cfg(not(feature = "zstd-compression"))]
                 {
@@ -115,11 +217,12 @@ fn verify_object(
                 {
                     let mut decoder = xz2::read::XzDecoder::new(raw.as_slice());
                     let mut decompressed = Vec::new();
-                    std::io::Read::read_to_end(&mut decoder, &mut decompressed)
-                        .map_err(|e| Error::CorruptObject {
+                    std::io::Read::read_to_end(&mut decoder, &mut decompressed).map_err(|e| {
+                        Error::CorruptObject {
                             offset,
                             reason: format!("XZ decompression failed during verify: {}", e),
-                        })?;
+                        }
+                    })?;
                     decompressed
                 }
                 #[cfg(not(feature = "xz-compression"))]
@@ -135,12 +238,14 @@ fn verify_object(
                             reason: "LZ4 data too short for size prefix".into(),
                         });
                     }
-                    let uncompressed_size = u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
-                    lz4_flex::decompress(&raw[8..], uncompressed_size)
-                        .map_err(|e| Error::CorruptObject {
+                    let uncompressed_size =
+                        u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
+                    lz4_flex::decompress(&raw[8..], uncompressed_size).map_err(|e| {
+                        Error::CorruptObject {
                             offset,
                             reason: format!("LZ4 decompression failed during verify: {}", e),
-                        })?
+                        }
+                    })?
                 }
                 #[cfg(not(feature = "lz4-compression"))]
                 {
@@ -172,12 +277,118 @@ fn verify_object(
                 });
             }
         }
+        ObjectType::Field => {
+            // systemd: journal-verify.c:206-238
+
+            if obj_size <= FIELD_OBJECT_HEADER_SIZE as u64 {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: "FIELD object has no payload".into(),
+                });
+            }
+
+            // Hash verification
+            let stored_hash = read_u64_at(file, offset + 16)?;
+            let payload_len = (obj_size - FIELD_OBJECT_HEADER_SIZE as u64) as usize;
+            let payload =
+                read_bytes_at(file, offset + FIELD_OBJECT_HEADER_SIZE as u64, payload_len)?;
+            let computed_hash = journal_file_hash_data(&payload, keyed_hash, file_id);
+            if stored_hash != computed_hash {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "FIELD hash mismatch: stored={:#x} computed={:#x}",
+                        stored_hash, computed_hash
+                    ),
+                });
+            }
+
+            // Pointer alignment checks
+            let next_hash_offset = read_u64_at(file, offset + 24)?;
+            if next_hash_offset != 0 && !valid64(next_hash_offset) {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "FIELD next_hash_offset {:#x} not aligned",
+                        next_hash_offset
+                    ),
+                });
+            }
+            let head_data_offset = read_u64_at(file, offset + 32)?;
+            if head_data_offset != 0 && !valid64(head_data_offset) {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "FIELD head_data_offset {:#x} not aligned",
+                        head_data_offset
+                    ),
+                });
+            }
+        }
         ObjectType::Entry => {
-            // Verify entry items reference valid offsets (> header_size, aligned)
+            // systemd: journal-verify.c:242-276
+
             let item_sz = entry_item_size(compact);
             let items_bytes = obj_size.saturating_sub(ENTRY_OBJECT_HEADER_SIZE as u64);
+
+            // Size modulo check
+            if items_bytes % item_sz != 0 {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "ENTRY items region {} not divisible by item size {}",
+                        items_bytes, item_sz
+                    ),
+                });
+            }
+
             let n_items = items_bytes / item_sz;
 
+            // n_items > 0
+            if n_items == 0 {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: "ENTRY has no items".into(),
+                });
+            }
+
+            // seqnum > 0
+            let seqnum = read_u64_at(file, offset + 16)?;
+            if seqnum == 0 {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: "ENTRY seqnum is zero".into(),
+                });
+            }
+
+            // VALID_REALTIME: u > 0 && u < (1<<55)
+            let realtime = read_u64_at(file, offset + 24)?;
+            if realtime == 0 || realtime >= TIMESTAMP_UPPER {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!("ENTRY realtime {} invalid", realtime),
+                });
+            }
+
+            // VALID_MONOTONIC: u < (1<<55), 0 IS valid
+            let monotonic = read_u64_at(file, offset + 32)?;
+            if monotonic >= TIMESTAMP_UPPER {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!("ENTRY monotonic {} invalid", monotonic),
+                });
+            }
+
+            // boot_id must not be null
+            let boot_bytes = read_bytes_at(file, offset + 40, 16)?;
+            if boot_bytes == [0u8; 16] {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: "ENTRY boot_id is null".into(),
+                });
+            }
+
+            // Verify each entry item has valid offset
             for i in 0..n_items {
                 let item_off = offset + ENTRY_OBJECT_HEADER_SIZE as u64 + i * item_sz;
                 let data_off = if compact {
@@ -195,19 +406,107 @@ fn verify_object(
                 if !valid64(data_off) {
                     return Err(Error::CorruptObject {
                         offset,
-                        reason: format!("ENTRY item {} data offset {:#x} not aligned", i, data_off),
+                        reason: format!(
+                            "ENTRY item {} data offset {:#x} not aligned",
+                            i, data_off
+                        ),
+                    });
+                }
+            }
+        }
+        ObjectType::DataHashTable | ObjectType::FieldHashTable => {
+            // systemd: journal-verify.c:291-334
+
+            let items_bytes = obj_size.saturating_sub(OBJECT_HEADER_SIZE as u64);
+            if items_bytes % HASH_ITEM_SIZE as u64 != 0 {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "HASH_TABLE items region {} not divisible by HashItem size {}",
+                        items_bytes, HASH_ITEM_SIZE
+                    ),
+                });
+            }
+            let n_items = items_bytes / HASH_ITEM_SIZE as u64;
+            if n_items == 0 {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: "HASH_TABLE has no items".into(),
+                });
+            }
+
+            // Per-item head/tail pointer checks
+            for i in 0..n_items {
+                let item_off = offset + OBJECT_HEADER_SIZE as u64 + i * HASH_ITEM_SIZE as u64;
+                let head = read_u64_at(file, item_off)?;
+                let tail = read_u64_at(file, item_off + 8)?;
+
+                // Both zero or both non-zero
+                if (head == 0) != (tail == 0) {
+                    return Err(Error::CorruptObject {
+                        offset,
+                        reason: format!(
+                            "HASH_TABLE bucket {} head={:#x} tail={:#x} inconsistent",
+                            i, head, tail
+                        ),
+                    });
+                }
+
+                if head != 0 && !valid64(head) {
+                    return Err(Error::CorruptObject {
+                        offset,
+                        reason: format!(
+                            "HASH_TABLE bucket {} head {:#x} not aligned",
+                            i, head
+                        ),
+                    });
+                }
+                if tail != 0 && !valid64(tail) {
+                    return Err(Error::CorruptObject {
+                        offset,
+                        reason: format!(
+                            "HASH_TABLE bucket {} tail {:#x} not aligned",
+                            i, tail
+                        ),
                     });
                 }
             }
         }
         ObjectType::EntryArray => {
-            // Verify items are monotonically increasing
+            // systemd: journal-verify.c:336-361
+
             let ea_item_sz = entry_array_item_size(compact);
+            let items_bytes = obj_size.saturating_sub(ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64);
+
+            // Size modulo check
+            if items_bytes % ea_item_sz != 0 {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "ENTRY_ARRAY items region {} not divisible by {}",
+                        items_bytes, ea_item_sz
+                    ),
+                });
+            }
+
+            // VALID64 on next_entry_array_offset
+            let next_ea = read_u64_at(file, offset + 16)?;
+            if next_ea != 0 && !valid64(next_ea) {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "ENTRY_ARRAY next_entry_array_offset {:#x} not aligned",
+                        next_ea
+                    ),
+                });
+            }
+
+            // Per-item VALID64 and monotonicity check
             let n_items = entry_array_n_items(obj_size, compact);
             let mut prev_off = 0u64;
-
             for i in 0..n_items {
-                let item_off = offset + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + i * ea_item_sz;
+                let item_off =
+                    offset + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + i * ea_item_sz;
                 let entry_off = if compact {
                     read_u32_at(file, item_off)? as u64
                 } else {
@@ -216,6 +515,16 @@ fn verify_object(
 
                 if entry_off == 0 {
                     break; // unused slots at end
+                }
+
+                if !valid64(entry_off) {
+                    return Err(Error::CorruptObject {
+                        offset,
+                        reason: format!(
+                            "ENTRY_ARRAY item {} offset {:#x} not aligned",
+                            i, entry_off
+                        ),
+                    });
                 }
 
                 if entry_off <= prev_off && prev_off != 0 {
@@ -230,24 +539,344 @@ fn verify_object(
                 prev_off = entry_off;
             }
         }
-        _ => {} // Other types validated by check_object
+        ObjectType::Tag => {
+            // systemd: journal-verify.c:364-378
+
+            const TAG_OBJECT_SIZE: u64 = OBJECT_HEADER_SIZE as u64 + 8 + 8 + 32;
+            if obj_size != TAG_OBJECT_SIZE {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "TAG object size {} != expected {}",
+                        obj_size, TAG_OBJECT_SIZE
+                    ),
+                });
+            }
+
+            // Epoch validity: epoch < (1<<55)
+            let epoch = read_u64_at(file, offset + 24)?;
+            if epoch >= TIMESTAMP_UPPER {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!("TAG epoch {} invalid (>= 2^55)", epoch),
+                });
+            }
+        }
+        _ => {} // Unused validated by check_object_header
     }
 
     Ok(())
 }
 
-// ── Main verification function ──────────────────────────────────────────
+// -- Second-pass verification functions -----------------------------------
+
+/// systemd: journal-verify.c:390-449 data_object_in_hash_table
+///
+/// Confirm that a data object at `data_offset` is reachable from its
+/// correct bucket in the data hash table.
+fn data_object_in_hash_table(
+    file: &mut File,
+    data_offset: u64,
+    stored_hash: u64,
+    data_ht_offset: u64,
+    data_ht_size: u64,
+) -> Result<bool> {
+    let n_buckets = data_ht_size / HASH_ITEM_SIZE as u64;
+    if n_buckets == 0 {
+        return Ok(false);
+    }
+    let bucket = stored_hash % n_buckets;
+    let item_off = data_ht_offset + bucket * HASH_ITEM_SIZE as u64;
+    let mut cur = read_u64_at(file, item_off)?;
+
+    while cur != 0 {
+        if cur == data_offset {
+            return Ok(true);
+        }
+        // next_hash_offset is at offset 24 within DataObjectHeader
+        cur = read_u64_at(file, cur + 24)?;
+    }
+    Ok(false)
+}
+
+/// systemd: journal-verify.c:452-561 verify_data_hash_table
+///
+/// Walk each bucket of the data hash table, verify:
+/// - Each referenced object is in `data_offsets`
+/// - Each object's hash maps to the correct bucket
+/// - Tail pointers match the last element in each chain
+fn verify_data_hash_table(
+    file: &mut File,
+    data_ht_offset: u64,
+    data_ht_size: u64,
+    data_offsets: &HashSet<u64>,
+) -> Result<()> {
+    if data_ht_offset == 0 || data_ht_size == 0 {
+        return Ok(());
+    }
+    let n_buckets = data_ht_size / HASH_ITEM_SIZE as u64;
+
+    for bucket in 0..n_buckets {
+        let item_off = data_ht_offset + bucket * HASH_ITEM_SIZE as u64;
+        let head = read_u64_at(file, item_off)?;
+        let tail = read_u64_at(file, item_off + 8)?;
+
+        let mut cur = head;
+        let mut last = 0u64;
+        #[allow(unused_assignments)]
+        let mut prev = 0u64;
+
+        while cur != 0 {
+            if !data_offsets.contains(&cur) {
+                return Err(Error::InvalidFile(format!(
+                    "data hash table bucket {} references {:#x} which is not a DATA object",
+                    bucket, cur
+                )));
+            }
+
+            // Verify hash maps to this bucket
+            let stored_hash = read_u64_at(file, cur + 16)?;
+            if stored_hash % n_buckets != bucket {
+                return Err(Error::InvalidFile(format!(
+                    "DATA at {:#x} has hash {:#x} -> bucket {} but is in bucket {}",
+                    cur,
+                    stored_hash,
+                    stored_hash % n_buckets,
+                    bucket
+                )));
+            }
+
+            last = cur;
+            prev = cur;
+            cur = read_u64_at(file, cur + 24)?;
+
+            if cur != 0 && cur <= prev {
+                return Err(Error::InvalidFile(format!(
+                    "data hash chain loop at bucket {}: {:#x} <= {:#x}",
+                    bucket, cur, prev
+                )));
+            }
+        }
+
+        // Verify tail pointer
+        if last != tail {
+            return Err(Error::InvalidFile(format!(
+                "data hash table bucket {} tail mismatch: chain ends at {:#x} but tail={:#x}",
+                bucket, last, tail
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// systemd: journal-verify.c:563-641 verify_entry
+///
+/// For a single entry, verify each data item:
+/// - Points to a known DATA object
+/// - The DATA object is reachable from the hash table
+fn verify_entry(
+    file: &mut File,
+    entry_offset: u64,
+    obj_size: u64,
+    compact: bool,
+    data_offsets: &HashSet<u64>,
+    data_ht_offset: u64,
+    data_ht_size: u64,
+) -> Result<()> {
+    let item_sz = entry_item_size(compact);
+    let items_bytes = obj_size.saturating_sub(ENTRY_OBJECT_HEADER_SIZE as u64);
+    let n_items = items_bytes / item_sz;
+
+    for i in 0..n_items {
+        let data_off = read_entry_item_offset(file, entry_offset, i, compact)?;
+
+        if data_off == 0 {
+            return Err(Error::InvalidFile(format!(
+                "ENTRY at {:#x} item {} has null data offset",
+                entry_offset, i
+            )));
+        }
+
+        if !data_offsets.contains(&data_off) {
+            return Err(Error::InvalidFile(format!(
+                "ENTRY at {:#x} item {} references {:#x} which is not a DATA object",
+                entry_offset, i, data_off
+            )));
+        }
+
+        // Verify the DATA object is reachable from the hash table
+        let stored_hash = read_u64_at(file, data_off + 16)?;
+        if !data_object_in_hash_table(file, data_off, stored_hash, data_ht_offset, data_ht_size)? {
+            return Err(Error::InvalidFile(format!(
+                "DATA at {:#x} (referenced by ENTRY {:#x} item {}) not reachable from hash table",
+                data_off, entry_offset, i
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// systemd: journal-verify.c:643-741 verify_entry_array
+///
+/// Walk the main entry array chain (starting from `entry_array_offset`),
+/// verify each entry offset points to a known entry, and verify ordering.
+fn verify_entry_array(
+    file: &mut File,
+    entry_array_offset: u64,
+    compact: bool,
+    entry_offsets: &HashSet<u64>,
+    n_entries: u64,
+) -> Result<()> {
+    if entry_array_offset == 0 {
+        return Ok(());
+    }
+
+    let mut cur_array = entry_array_offset;
+    let mut total_seen = 0u64;
+    let mut prev_entry_off = 0u64;
+
+    while cur_array != 0 {
+        let ea_size = read_u64_at(file, cur_array + 8)?;
+        let n_items = entry_array_n_items(ea_size, compact);
+
+        for i in 0..n_items {
+            let entry_off = read_entry_array_item(file, cur_array, i, compact)?;
+            if entry_off == 0 {
+                break;
+            }
+
+            if !entry_offsets.contains(&entry_off) {
+                return Err(Error::InvalidFile(format!(
+                    "main entry array references {:#x} which is not an ENTRY object",
+                    entry_off
+                )));
+            }
+
+            if entry_off <= prev_entry_off && prev_entry_off != 0 {
+                return Err(Error::InvalidFile(format!(
+                    "main entry array not monotonic: {:#x} <= {:#x}",
+                    entry_off, prev_entry_off
+                )));
+            }
+            prev_entry_off = entry_off;
+            total_seen += 1;
+        }
+
+        let next_ea = read_u64_at(file, cur_array + 16)?;
+        if next_ea != 0 && next_ea <= cur_array {
+            return Err(Error::InvalidFile(format!(
+                "entry array chain loop: next {:#x} <= current {:#x}",
+                next_ea, cur_array
+            )));
+        }
+        cur_array = next_ea;
+    }
+
+    if total_seen != n_entries {
+        return Err(Error::InvalidFile(format!(
+            "main entry array contains {} entries but header says {}",
+            total_seen, n_entries
+        )));
+    }
+
+    Ok(())
+}
+
+/// systemd: journal-verify.c:743-810 verify_data
+///
+/// For each data object, walk its per-data entry array chain and verify
+/// each referenced entry exists in `entry_offsets`.
+fn verify_data(
+    file: &mut File,
+    data_offsets: &HashSet<u64>,
+    entry_offsets: &HashSet<u64>,
+    compact: bool,
+) -> Result<()> {
+    for &data_off in data_offsets {
+        let entry_offset = read_u64_at(file, data_off + 40)?;
+        let entry_array_offset = read_u64_at(file, data_off + 48)?;
+        let n_entries = read_u64_at(file, data_off + 56)?;
+
+        if n_entries == 0 {
+            continue;
+        }
+
+        let mut counted = 0u64;
+
+        // First entry is the inline one (entry_offset)
+        if entry_offset != 0 {
+            if !entry_offsets.contains(&entry_offset) {
+                return Err(Error::InvalidFile(format!(
+                    "DATA at {:#x} inline entry_offset {:#x} is not a known ENTRY",
+                    data_off, entry_offset
+                )));
+            }
+            counted += 1;
+        }
+
+        // Walk the entry array chain
+        let mut cur_array = entry_array_offset;
+        while cur_array != 0 {
+            let ea_size = read_u64_at(file, cur_array + 8)?;
+            let n_items = entry_array_n_items(ea_size, compact);
+
+            for i in 0..n_items {
+                let entry_off = read_entry_array_item(file, cur_array, i, compact)?;
+                if entry_off == 0 {
+                    break;
+                }
+
+                if !entry_offsets.contains(&entry_off) {
+                    return Err(Error::InvalidFile(format!(
+                        "DATA at {:#x} entry array references {:#x} which is not a known ENTRY",
+                        data_off, entry_off
+                    )));
+                }
+                counted += 1;
+            }
+
+            let next_ea = read_u64_at(file, cur_array + 16)?;
+            if next_ea != 0 && next_ea <= cur_array {
+                return Err(Error::InvalidFile(format!(
+                    "DATA at {:#x} entry array chain loop: next {:#x} <= current {:#x}",
+                    data_off, next_ea, cur_array
+                )));
+            }
+            cur_array = next_ea;
+        }
+
+        if counted != n_entries {
+            return Err(Error::InvalidFile(format!(
+                "DATA at {:#x} n_entries={} but counted {} in entry chain",
+                data_off, n_entries, counted
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+// -- Main verification function -------------------------------------------
 
 /// systemd: journal-verify.c:812-1436 journal_file_verify
 ///
 /// Verify the structural integrity of a journal file.
 ///
 /// Performs:
-/// 1. Header verification
-/// 2. Sequential object walk with per-object validation
-/// 3. Entry ordering checks (seqnum monotonic, realtime non-decreasing)
-/// 4. Object count verification against header values
-/// 5. Hash table consistency check
+/// 1. Header verification (signature, flags, sizes, offsets)
+/// 2. Compatible flags check
+/// 3. Sequential object walk with per-object validation
+/// 4. Entry ordering checks (seqnum monotonic, realtime non-decreasing)
+/// 5. Object count verification against header values
+/// 6. Hash table offset/size consistency
+/// 7. Tail entry monotonic/boot_id check
+/// 8. Second-pass cross-reference verification:
+///    a. Data hash table chain walk and bucket mapping
+///    b. Entry -> data bidirectional reference
+///    c. Main entry array chain walk
+///    d. Per-data entry array chain walk
 pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
     let mut file = File::open(path)?;
 
@@ -258,12 +887,24 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
     let header: Header = unsafe { std::ptr::read_unaligned(hbuf.as_ptr() as *const Header) };
 
     let file_size = file.metadata()?.len();
-    verify_header(&header, file_size, false)?;
+    verify_header(&header, file_size, false, None)?;
 
     let incompat = from_le32(&header.incompatible_flags);
+    let compat = from_le32(&header.compatible_flags);
     let keyed_hash = (incompat & incompat::KEYED_HASH) != 0;
     let compact = (incompat & incompat::COMPACT) != 0;
     let header_size = from_le64(&header.header_size);
+
+    // systemd: journal-verify.c:915-919
+    // Compatible flags check -- we understand SEALED, TAIL_ENTRY_BOOT_ID, SEALED_CONTINUOUS
+    let known_compat = compat::SEALED | compat::TAIL_ENTRY_BOOT_ID | compat::SEALED_CONTINUOUS;
+    let unknown_compat = compat & !known_compat;
+    if unknown_compat != 0 {
+        return Err(Error::InvalidFile(format!(
+            "unknown compatible flags {:#x} set",
+            unknown_compat
+        )));
+    }
 
     // Verify reserved bytes are zero
     for (i, &b) in header.reserved.iter().enumerate() {
@@ -276,7 +917,59 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
     }
 
     let tail_object_offset = from_le64(&header.tail_object_offset);
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
+
+    // Verify hash table offset/size consistency with header
+    let data_ht_offset = from_le64(&header.data_hash_table_offset);
+    let data_ht_size = from_le64(&header.data_hash_table_size);
+    let field_ht_offset = from_le64(&header.field_hash_table_offset);
+    let field_ht_size = from_le64(&header.field_hash_table_size);
+
+    // Data hash table bounds check
+    if data_ht_offset != 0 {
+        if data_ht_offset < header_size {
+            return Err(Error::InvalidFile(format!(
+                "data_hash_table_offset {:#x} < header_size {:#x}",
+                data_ht_offset, header_size
+            )));
+        }
+        if data_ht_size == 0 {
+            return Err(Error::InvalidFile(
+                "data_hash_table_offset set but data_hash_table_size is 0".into(),
+            ));
+        }
+        if data_ht_offset
+            .checked_add(data_ht_size)
+            .map_or(true, |end| end > file_size)
+        {
+            return Err(Error::InvalidFile(
+                "data hash table extends past end of file".into(),
+            ));
+        }
+    }
+
+    // Field hash table bounds check
+    if field_ht_offset != 0 {
+        if field_ht_offset < header_size {
+            return Err(Error::InvalidFile(format!(
+                "field_hash_table_offset {:#x} < header_size {:#x}",
+                field_ht_offset, header_size
+            )));
+        }
+        if field_ht_size == 0 {
+            return Err(Error::InvalidFile(
+                "field_hash_table_offset set but field_hash_table_size is 0".into(),
+            ));
+        }
+        if field_ht_offset
+            .checked_add(field_ht_size)
+            .map_or(true, |end| end > file_size)
+        {
+            return Err(Error::InvalidFile(
+                "field hash table extends past end of file".into(),
+            ));
+        }
+    }
 
     // Counters
     let mut n_objects: u64 = 0;
@@ -298,15 +991,19 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
     let mut min_entry_realtime: u64 = u64::MAX;
     let mut max_entry_realtime: u64 = 0;
 
-    // Data offsets seen (for entry cross-reference)
+    // Track last entry monotonic/boot_id for tail check
+    let mut last_entry_monotonic: u64 = 0;
+    let mut last_entry_boot_id = [0u8; 16];
+
+    // Offset tracking for cross-reference
     let mut data_offsets: HashSet<u64> = HashSet::new();
+    let mut entry_offsets: HashSet<u64> = HashSet::new();
     let mut found_main_entry_array = false;
 
     // First pass: walk all objects sequentially
     let mut p = header_size;
 
     if tail_object_offset == 0 {
-        // Empty file
         return Ok(VerifyResult {
             n_objects: 0,
             n_entries: 0,
@@ -346,7 +1043,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         let obj_size = read_u64_at(&mut file, p + 8)?;
 
         // Basic header validation
-        check_object_header(obj_type_byte, obj_size, p, compact)?;
+        check_object_header(obj_type_byte, obj_size, p, compact, None)?;
 
         // Compression flag consistency
         let compressed = obj_flags_byte & obj_flags::COMPRESSED_MASK;
@@ -425,7 +1122,10 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                 entry_seqnum_set = true;
 
                 // Monotonic ordering (same boot)
-                if entry_monotonic_set && boot_id == entry_boot_id && monotonic < entry_monotonic {
+                if entry_monotonic_set
+                    && boot_id == entry_boot_id
+                    && monotonic < entry_monotonic
+                {
                     return Err(Error::CorruptObject {
                         offset: p,
                         reason: format!(
@@ -437,6 +1137,9 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                 entry_monotonic = monotonic;
                 entry_boot_id = boot_id;
                 entry_monotonic_set = true;
+
+                last_entry_monotonic = monotonic;
+                last_entry_boot_id = boot_id;
 
                 // Realtime tracking
                 if !entry_realtime_set {
@@ -454,6 +1157,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                 max_entry_realtime = max_entry_realtime.max(realtime);
 
                 n_entries += 1;
+                entry_offsets.insert(p);
             }
             ObjectType::DataHashTable => {
                 n_data_hash_tables += 1;
@@ -463,6 +1167,21 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                         reason: "more than one data hash table".into(),
                     });
                 }
+                // Verify hash table object offset/size matches header
+                let ht_obj_data_off = p + OBJECT_HEADER_SIZE as u64;
+                let ht_obj_data_size = obj_size - OBJECT_HEADER_SIZE as u64;
+                if data_ht_offset != ht_obj_data_off {
+                    return Err(Error::InvalidFile(format!(
+                        "data_hash_table_offset {:#x} != hash table object data at {:#x}",
+                        data_ht_offset, ht_obj_data_off
+                    )));
+                }
+                if data_ht_size != ht_obj_data_size {
+                    return Err(Error::InvalidFile(format!(
+                        "data_hash_table_size {} != hash table object data size {}",
+                        data_ht_size, ht_obj_data_size
+                    )));
+                }
             }
             ObjectType::FieldHashTable => {
                 n_field_hash_tables += 1;
@@ -471,6 +1190,20 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                         offset: p,
                         reason: "more than one field hash table".into(),
                     });
+                }
+                let ht_obj_data_off = p + OBJECT_HEADER_SIZE as u64;
+                let ht_obj_data_size = obj_size - OBJECT_HEADER_SIZE as u64;
+                if field_ht_offset != ht_obj_data_off {
+                    return Err(Error::InvalidFile(format!(
+                        "field_hash_table_offset {:#x} != hash table object data at {:#x}",
+                        field_ht_offset, ht_obj_data_off
+                    )));
+                }
+                if field_ht_size != ht_obj_data_size {
+                    return Err(Error::InvalidFile(format!(
+                        "field_hash_table_size {} != hash table object data size {}",
+                        field_ht_size, ht_obj_data_size
+                    )));
                 }
             }
             ObjectType::EntryArray => {
@@ -518,7 +1251,8 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         p = next;
     }
 
-    // Verify counts match header
+    // -- Post-walk header consistency checks ------------------------------
+
     let h_n_objects = from_le64(&header.n_objects);
     if n_objects != h_n_objects {
         return Err(Error::InvalidFile(format!(
@@ -578,52 +1312,57 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         }
     }
 
-    // Verify tail entry realtime
+    // systemd: journal-verify.c:1331-1335 -- tail_entry_realtime hard error
     if n_entries > 0 {
         let tail_realtime = from_le64(&header.tail_entry_realtime);
         if max_entry_realtime != tail_realtime {
-            warnings.push(format!(
+            return Err(Error::InvalidFile(format!(
                 "tail_entry_realtime mismatch: max seen {} != header {}",
                 max_entry_realtime, tail_realtime
+            )));
+        }
+    }
+
+    // systemd: journal-verify.c:1336-1346 -- tail_entry_monotonic/boot_id
+    if n_entries > 0 {
+        let tail_monotonic = from_le64(&header.tail_entry_monotonic);
+        if last_entry_monotonic != tail_monotonic {
+            return Err(Error::InvalidFile(format!(
+                "tail_entry_monotonic mismatch: last seen {} != header {}",
+                last_entry_monotonic, tail_monotonic
+            )));
+        }
+
+        if (compat & compat::TAIL_ENTRY_BOOT_ID) != 0
+            && last_entry_boot_id != header.tail_entry_boot_id
+        {
+            return Err(Error::InvalidFile(
+                "tail_entry_boot_id mismatch: last entry boot_id != header tail_entry_boot_id"
+                    .into(),
             ));
         }
     }
 
-    // ── Second pass: cross-reference verification ───────────────────────
-    // systemd: journal-verify.c after the main object walk
-
-    // Verify data hash table chains reference valid DATA objects
-    let data_ht_offset = from_le64(&header.data_hash_table_offset);
-    let data_ht_size = from_le64(&header.data_hash_table_size);
-    if data_ht_offset > 0 && data_ht_size > 0 {
-        let ht_n = data_ht_size / HASH_ITEM_SIZE as u64;
-        for bucket in 0..ht_n {
-            let item_off = data_ht_offset + bucket * HASH_ITEM_SIZE as u64;
-            let head = read_u64_at(&mut file, item_off)?;
-            let mut cur = head;
-            let mut prev = 0u64;
-            while cur > 0 {
-                if !data_offsets.contains(&cur) {
-                    return Err(Error::InvalidFile(format!(
-                        "data hash table bucket {} references offset {:#x} which is not a DATA object",
-                        bucket, cur
-                    )));
-                }
-                // Read next_hash_offset (offset 24 in DataObjectHeader)
-                prev = cur;
-                cur = read_u64_at(&mut file, cur + 24)?;
-                if cur > 0 && cur <= prev {
-                    return Err(Error::InvalidFile(format!(
-                        "data hash chain loop at bucket {}: {:#x} <= {:#x}",
-                        bucket, cur, prev
-                    )));
-                }
-            }
-        }
+    // Verify found_main_entry_array when entry_array_offset != 0
+    let entry_array_off = from_le64(&header.entry_array_offset);
+    if entry_array_off != 0 && !found_main_entry_array {
+        return Err(Error::InvalidFile(format!(
+            "header entry_array_offset={:#x} but no matching entry array object found",
+            entry_array_off
+        )));
+    }
+    if entry_array_off == 0 && n_entries > 0 {
+        return Err(Error::InvalidFile(
+            "entries exist but header entry_array_offset is 0".into(),
+        ));
     }
 
-    // Verify entry items reference valid DATA objects
-    // Re-walk entries and check each item points to a known DATA offset
+    // -- Second pass: cross-reference verification ------------------------
+
+    // 1. Verify data hash table chains
+    verify_data_hash_table(&mut file, data_ht_offset, data_ht_size, &data_offsets)?;
+
+    // 2. Verify each entry's data items exist and are reachable from hash table
     let mut p2 = header_size;
     if tail_object_offset > 0 {
         loop {
@@ -636,23 +1375,15 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
             let obj_size2 = read_u64_at(&mut file, p2 + 8)?;
 
             if obj_type_byte2 == ObjectType::Entry as u8 {
-                let item_sz = entry_item_size(compact);
-                let items_bytes = obj_size2.saturating_sub(ENTRY_OBJECT_HEADER_SIZE as u64);
-                let n_items = items_bytes / item_sz;
-                for i in 0..n_items {
-                    let item_off = p2 + ENTRY_OBJECT_HEADER_SIZE as u64 + i * item_sz;
-                    let data_off = if compact {
-                        read_u32_at(&mut file, item_off)? as u64
-                    } else {
-                        read_u64_at(&mut file, item_off)?
-                    };
-                    if data_off > 0 && !data_offsets.contains(&data_off) {
-                        return Err(Error::InvalidFile(format!(
-                            "ENTRY at {:#x} item {} references {:#x} which is not a DATA object",
-                            p2, i, data_off
-                        )));
-                    }
-                }
+                verify_entry(
+                    &mut file,
+                    p2,
+                    obj_size2,
+                    compact,
+                    &data_offsets,
+                    data_ht_offset,
+                    data_ht_size,
+                )?;
             }
 
             if p2 == tail_object_offset {
@@ -665,6 +1396,18 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
             p2 = next2;
         }
     }
+
+    // 3. Verify main entry array chain
+    verify_entry_array(
+        &mut file,
+        entry_array_off,
+        compact,
+        &entry_offsets,
+        n_entries,
+    )?;
+
+    // 4. Verify per-data entry array chains
+    verify_data(&mut file, &data_offsets, &entry_offsets, compact)?;
 
     Ok(VerifyResult {
         n_objects,
@@ -704,7 +1447,6 @@ mod tests {
             w.append_entry(&[("MESSAGE", b"test" as &[u8])]).unwrap();
             w.flush().unwrap();
         }
-        // File is closed (state=OFFLINE), verify it
         let result = journal_file_verify(&path).unwrap();
         assert_eq!(result.n_entries, 1);
         assert!(result.n_data >= 1);
@@ -738,12 +1480,64 @@ mod tests {
             w.append_entry(&[("MESSAGE", b"test" as &[u8])]).unwrap();
             w.flush().unwrap();
         }
-        // Corrupt the signature
         {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             f.write_all(b"BADMAGIC").unwrap();
         }
         assert!(journal_file_verify(&path).is_err());
+    }
+
+    #[test]
+    fn test_verify_multiple_fields() {
+        let path = tmp_path("qjournal_verify_multifield.journal");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut w = JournalWriter::open(&path).unwrap();
+            w.append_entry(&[
+                ("MESSAGE", b"hello" as &[u8]),
+                ("PRIORITY", b"6"),
+                ("_HOSTNAME", b"test"),
+            ])
+            .unwrap();
+            w.flush().unwrap();
+        }
+        let result = journal_file_verify(&path).unwrap();
+        assert_eq!(result.n_entries, 1);
+        assert!(result.n_data >= 3);
+        assert!(result.n_fields >= 3);
+    }
+
+    #[test]
+    fn test_verify_data_hash_integrity() {
+        let path = tmp_path("qjournal_verify_hash.journal");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut w = JournalWriter::open(&path).unwrap();
+            for i in 0..50 {
+                let msg = format!("message number {}", i);
+                w.append_entry(&[("MESSAGE", msg.as_bytes())]).unwrap();
+            }
+            w.flush().unwrap();
+        }
+        let result = journal_file_verify(&path).unwrap();
+        assert_eq!(result.n_entries, 50);
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_verify_entry_array_chain() {
+        let path = tmp_path("qjournal_verify_ea_chain.journal");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut w = JournalWriter::open(&path).unwrap();
+            for i in 0..100 {
+                let msg = format!("entry {}", i);
+                w.append_entry(&[("MESSAGE", msg.as_bytes())]).unwrap();
+            }
+            w.flush().unwrap();
+        }
+        let result = journal_file_verify(&path).unwrap();
+        assert_eq!(result.n_entries, 100);
     }
 }
