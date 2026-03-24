@@ -19,7 +19,7 @@ use crate::{
     mmap_cache::MmapCache,
     writer::{
         check_object, check_object_header, data_payload_offset, entry_array_item_size,
-        entry_item_size, entry_array_n_items, journal_file_hash_data, offset_is_valid,
+        entry_item_size, entry_array_n_items, journal_file_hash_data,
         verify_header,
     },
 };
@@ -53,6 +53,7 @@ const CHAIN_CACHE_MAX: usize = 20;
 /// systemd: journal-file.c:2662-2669 ChainCacheItem
 #[derive(Debug, Clone)]
 struct ChainCacheItem {
+    #[allow(dead_code)]
     first: u64,
     array: u64,
     begin: u64,
@@ -137,7 +138,7 @@ impl JournalReader {
         let h: Header = unsafe { std::ptr::read_unaligned(hbuf.as_ptr() as *const Header) };
 
         let file_size = file.metadata()?.len();
-        verify_header(&h, file_size, false)?;
+        verify_header(&h, file_size, false, None)?;
 
         let incompat = from_le32(&h.incompatible_flags);
         let keyed_hash = (incompat & incompat::KEYED_HASH) != 0;
@@ -217,19 +218,8 @@ impl JournalReader {
         let obj_type = self.mmap.read_u8(offset).ok_or(Error::Truncated { offset })?;
         let obj_size = self.read_u64_at(offset + 8)?;
 
-        // check_object_header (includes type range + minimum size check)
-        check_object_header(obj_type, obj_size, offset, self.compact)?;
-
-        // Type check
-        if expected_type != ObjectType::Unused && obj_type != expected_type as u8 {
-            return Err(Error::CorruptObject {
-                offset,
-                reason: format!(
-                    "expected {:?} object, got type {}",
-                    expected_type, obj_type
-                ),
-            });
-        }
+        // check_object_header (includes type range + minimum size + expected type check)
+        check_object_header(obj_type, obj_size, offset, self.compact, Some(expected_type))?;
 
         // Per-type validation (systemd: check_object, C:936-1086)
         // Read type-specific fields for validation
@@ -269,8 +259,51 @@ impl JournalReader {
                 check_object(otype, obj_size, flags, offset, self.compact,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, &[0u8; 16], 0, epoch)?;
             }
+            ObjectType::Field => {
+                // systemd: journal-file.c:977-998
+                if obj_size <= FIELD_OBJECT_HEADER_SIZE as u64 {
+                    return Err(Error::CorruptObject {
+                        offset,
+                        reason: "FIELD object has no payload".into(),
+                    });
+                }
+                let next_hash = self.read_u64_at(offset + 24)?;
+                if next_hash != 0 && !valid64(next_hash) {
+                    return Err(Error::CorruptObject {
+                        offset,
+                        reason: "FIELD next_hash_offset not aligned".into(),
+                    });
+                }
+                let head_data = self.read_u64_at(offset + 32)?;
+                if head_data != 0 && !valid64(head_data) {
+                    return Err(Error::CorruptObject {
+                        offset,
+                        reason: "FIELD head_data_offset not aligned".into(),
+                    });
+                }
+            }
+            ObjectType::DataHashTable | ObjectType::FieldHashTable => {
+                // systemd: journal-file.c:1048-1062
+                let items_bytes = obj_size.saturating_sub(OBJECT_HEADER_SIZE as u64);
+                if items_bytes % HASH_ITEM_SIZE as u64 != 0 {
+                    return Err(Error::CorruptObject {
+                        offset,
+                        reason: format!(
+                            "HASH_TABLE items region {} not divisible by HashItem size {}",
+                            items_bytes, HASH_ITEM_SIZE
+                        ),
+                    });
+                }
+                let n_items = items_bytes / HASH_ITEM_SIZE as u64;
+                if n_items == 0 {
+                    return Err(Error::CorruptObject {
+                        offset,
+                        reason: "HASH_TABLE has no items".into(),
+                    });
+                }
+            }
             _ => {
-                // Field, HashTable, Unused — minimal validation already done by check_object_header
+                // Unused — minimal validation already done by check_object_header
             }
         }
 
@@ -326,6 +359,7 @@ impl JournalReader {
         let mut p = self.read_u64_at(item_off)?;
 
         // systemd: get_next_hash_offset tracks depth and detects loops
+        #[allow(unused_assignments)]
         let mut prev = 0u64;
 
         while p > 0 {
@@ -573,6 +607,17 @@ impl JournalReader {
     ) -> Result<Option<u64>> {
         match direction {
             Direction::Down => {
+                // Verify the object at arr_offset is actually an EntryArray
+                let obj_type = self.mmap.read_u8(arr_offset).ok_or(Error::Truncated { offset: arr_offset })?;
+                if obj_type != ObjectType::EntryArray as u8 {
+                    return Err(Error::CorruptObject {
+                        offset: arr_offset,
+                        reason: format!(
+                            "expected EntryArray object type, found {}",
+                            obj_type
+                        ),
+                    });
+                }
                 // Read next_entry_array_offset from current array
                 let next = self.read_u64_at(arr_offset + OBJECT_HEADER_SIZE as u64)?;
                 Ok(if next > 0 { Some(next) } else { None })
@@ -1023,6 +1068,12 @@ impl JournalReader {
     ) -> Result<Option<(u64, u64)>> {
         // Cache
         let begin = self.entry_array_item(arr_offset, 0)?;
+        if begin == 0 {
+            return Err(Error::CorruptObject {
+                offset: arr_offset,
+                reason: "first entry in array is null".into(),
+            });
+        }
         self.chain_cache_put(first, arr_offset, begin, t, i);
 
         let p = self.entry_array_item(arr_offset, i)?;
@@ -1180,6 +1231,8 @@ impl JournalReader {
             None => return Ok(None),
         };
 
+        debug_assert!(if direction == Direction::Down { p <= q } else { q <= p });
+
         if p == q {
             // Found exact match — move one step
             if !Self::bump_array_index(&mut i, direction, self.n_entries) {
@@ -1327,16 +1380,72 @@ impl JournalReader {
     }
 
     /// systemd: journal-file.c:3746-3776 journal_file_move_to_entry_by_monotonic_for_data
+    ///
+    /// Find an entry that belongs to BOTH the given data object's entry array
+    /// AND the boot-ID entry array, matching the requested monotonic timestamp.
+    /// This uses a convergence loop that bounces between the two entry arrays
+    /// via `move_to_entry_by_offset_for_data` until it finds an entry present
+    /// in both, or determines no such entry exists.
     pub fn move_to_entry_by_monotonic_for_data(
         &mut self,
         data_offset: u64,
+        boot_id: &[u8; 16],
         monotonic: u64,
         direction: Direction,
     ) -> Result<Option<u64>> {
+        // Pin the original data object
+        let _ = self.move_to_object(ObjectType::Data, data_offset)?;
+
+        // Look up the _BOOT_ID=<hex> data object
+        let boot_id_hex = boot_id
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        let boot_data = format!("_BOOT_ID={}", boot_id_hex);
+        let boot_id_offset = match self.find_data_object(boot_data.as_bytes())? {
+            Some(off) => off,
+            None => return Ok(None),
+        };
+
+        // Bisect the boot-ID object's entry array by monotonic time
         let test_monotonic = |s: &mut Self, p: u64, needle: u64| -> Result<i32> {
             s.test_object_monotonic(p, needle)
         };
-        self.generic_array_bisect_for_data(data_offset, monotonic, &test_monotonic, direction)
+        let mut p = match self.generic_array_bisect_for_data(
+            boot_id_offset,
+            monotonic,
+            &test_monotonic,
+            direction,
+        )? {
+            Some(off) => off,
+            None => return Ok(None),
+        };
+
+        // Convergence loop: bounce between the data object and the boot-ID
+        // object entry arrays until we find an entry present in both.
+        loop {
+            // Find entry at offset `p` in the original data object's array
+            let q = match self.move_to_entry_by_offset_for_data(data_offset, p, direction)? {
+                Some(off) => off,
+                None => return Ok(None),
+            };
+
+            // If both arrays agree, we found our entry
+            if p == q {
+                return Ok(Some(p));
+            }
+
+            // Now find entry at offset `q` in the boot-ID object's array
+            p = match self.move_to_entry_by_offset_for_data(boot_id_offset, q, direction)? {
+                Some(off) => off,
+                None => return Ok(None),
+            };
+
+            // If both arrays agree now, we found our entry
+            if q == p {
+                return Ok(Some(p));
+            }
+        }
     }
 
     /// systemd: journal-file.c:3607-3672 journal_file_move_to_entry_for_data
@@ -1451,7 +1560,7 @@ impl JournalReader {
             let mut seen = 1u64;
             while arr_off != 0 && seen < n_entries {
                 let (_, obj_size) = self.move_to_object(ObjectType::EntryArray, arr_off)?;
-                let item_sz = entry_array_item_size(self.compact);
+                let _item_sz = entry_array_item_size(self.compact);
                 let n_items = entry_array_n_items(obj_size, self.compact);
                 let next = self.read_u64_at(arr_off + OBJECT_HEADER_SIZE as u64)?;
 

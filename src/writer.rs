@@ -101,6 +101,7 @@ pub fn compression_requested() -> Compression {
 /// for syncing file data and transitioning the header state to OFFLINE when the
 /// journal file is not actively being written to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 #[repr(u8)]
 enum OfflineState {
     Joined = 0,
@@ -113,6 +114,7 @@ enum OfflineState {
 }
 
 impl OfflineState {
+    #[allow(dead_code)]
     fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::Joined,
@@ -293,7 +295,7 @@ pub fn minimum_header_size(obj_type: ObjectType, compact: bool) -> u64 {
 /// Validate an object header: type must be valid, size >= minimum for type,
 /// size must be 8-byte aligned (the STORED size is actual/unaligned, but
 /// the object must fit in aligned space).
-pub fn check_object_header(obj_type: u8, obj_size: u64, offset: u64, compact: bool) -> Result<()> {
+pub fn check_object_header(obj_type: u8, obj_size: u64, offset: u64, compact: bool, expected_type: Option<ObjectType>) -> Result<()> {
     // systemd: journal-file.c:901 — size == 0 means uninitialized object
     if obj_size == 0 {
         return Err(Error::CorruptObject {
@@ -314,6 +316,19 @@ pub fn check_object_header(obj_type: u8, obj_size: u64, offset: u64, compact: bo
         offset,
         reason: format!("invalid object type {}", obj_type),
     })?;
+
+    // systemd: journal-file.c:910-912 — expected type mismatch check
+    if let Some(expected) = expected_type {
+        if expected != ObjectType::Unused && otype != expected {
+            return Err(Error::CorruptObject {
+                offset,
+                reason: format!(
+                    "expected {:?} object, got {:?}",
+                    expected, otype
+                ),
+            });
+        }
+    }
 
     let min_size = minimum_header_size(otype, compact);
     if obj_size < min_size {
@@ -373,12 +388,12 @@ pub fn check_object(
     tag_epoch: u64,
 ) -> Result<()> {
     // First check the header basics
-    check_object_header(obj_type as u8, obj_size, offset, compact)?;
+    check_object_header(obj_type as u8, obj_size, offset, compact, None)?;
 
     match obj_type {
         ObjectType::Data => {
             // systemd: journal-file.c:943-975
-            if obj_size <= DATA_OBJECT_HEADER_SIZE as u64 {
+            if obj_size <= data_payload_offset(compact) {
                 return Err(Error::CorruptObject {
                     offset,
                     reason: "DATA object has no payload".into(),
@@ -598,7 +613,14 @@ pub fn check_object(
 /// systemd: journal-file.c:552-727 journal_file_verify_header
 ///
 /// Complete header verification: signature, flags, state, sizes, offsets, counts.
-pub fn verify_header(header: &Header, file_size: u64, writable: bool) -> Result<()> {
+/// `current_machine_id`: when Some, the header's machine_id must match (or be zero).
+/// Callers should pass `Some(machine_id())` for writable files on Linux, `None` otherwise.
+pub fn verify_header(
+    header: &Header,
+    file_size: u64,
+    writable: bool,
+    current_machine_id: Option<[u8; 16]>,
+) -> Result<()> {
     // Signature check
     if header.signature != HEADER_SIGNATURE {
         return Err(Error::InvalidFile("bad signature".into()));
@@ -682,6 +704,22 @@ pub fn verify_header(header: &Header, file_size: u64, writable: bool) -> Result<
         }
     }
 
+    // systemd: journal-file.c:588
+    // If SEALED compat flag is set, the header must be large enough to contain
+    // the n_entry_arrays field (offset 256, so header_size must be >= 264).
+    {
+        let compat = from_le32(&header.compatible_flags);
+        if (compat & compat::SEALED) != 0 {
+            // n_entry_arrays is at byte offset 256 in the header struct, size 8.
+            const N_ENTRY_ARRAYS_END: u64 = 264;
+            if header_size < N_ENTRY_ARRAYS_END {
+                return Err(Error::InvalidFile(
+                    "SEALED flag set but header too small for n_entry_arrays field".into(),
+                ));
+            }
+        }
+    }
+
     // arena_size bounds check
     let arena_size = from_le64(&header.arena_size);
     if header_size.checked_add(arena_size).is_none() {
@@ -756,6 +794,16 @@ pub fn verify_header(header: &Header, file_size: u64, writable: bool) -> Result<
                 "data hash table extends beyond file".into(),
             ));
         }
+        // systemd: journal-file.c:544 — hash table object must not exceed tail_object_offset
+        // data_ht_offset points past the ObjectHeader, so the object starts at offset - OBJECT_HEADER_SIZE
+        if tail_object_offset != 0 {
+            let obj_start = data_ht_offset - OBJECT_HEADER_SIZE as u64;
+            if obj_start > tail_object_offset {
+                return Err(Error::InvalidFile(
+                    "data_hash_table_offset beyond tail_object_offset".into(),
+                ));
+            }
+        }
     }
 
     // Field hash table offset/size validation
@@ -790,6 +838,15 @@ pub fn verify_header(header: &Header, file_size: u64, writable: bool) -> Result<
             return Err(Error::InvalidFile(
                 "field hash table extends beyond file".into(),
             ));
+        }
+        // systemd: journal-file.c:544 — hash table object must not exceed tail_object_offset
+        if tail_object_offset != 0 {
+            let obj_start = field_ht_offset - OBJECT_HEADER_SIZE as u64;
+            if obj_start > tail_object_offset {
+                return Err(Error::InvalidFile(
+                    "field_hash_table_offset beyond tail_object_offset".into(),
+                ));
+            }
         }
     }
 
@@ -829,6 +886,21 @@ pub fn verify_header(header: &Header, file_size: u64, writable: bool) -> Result<
         return Err(Error::InvalidFile(
             "tail_entry_array_offset/n_entries partially zero".into(),
         ));
+    }
+    // systemd: journal-file.c:631 — tail_entry_array_n_entries must not exceed the space
+    // available in the entry array object at tail_entry_array_offset.
+    if tail_entry_array_offset != 0 && tail_entry_array_n_entries > 0 {
+        let compact = (incompat & incompat::COMPACT) != 0;
+        let item_sz = entry_array_item_size(compact);
+        // Maximum object size: from tail_entry_array_offset to end of arena (total).
+        let max_obj_size = total.saturating_sub(tail_entry_array_offset);
+        let max_items = entry_array_n_items(max_obj_size, compact);
+        if tail_entry_array_n_entries > max_items {
+            return Err(Error::InvalidFile(format!(
+                "tail_entry_array_n_entries ({}) exceeds available space ({} items, item_sz={})",
+                tail_entry_array_n_entries, max_items, item_sz
+            )));
+        }
     }
 
     // systemd: journal-file.c:635-662
@@ -878,6 +950,13 @@ pub fn verify_header(header: &Header, file_size: u64, writable: bool) -> Result<
                 "no tail_entry but timestamps are non-zero".into(),
             ));
         }
+        // systemd: journal-file.c:653-655 — tail_entry_boot_id must be null when no entries exist
+        let compat = from_le32(&header.compatible_flags);
+        if (compat & compat::TAIL_ENTRY_BOOT_ID) != 0 && header.tail_entry_boot_id != [0u8; 16] {
+            return Err(Error::InvalidFile(
+                "no tail_entry but tail_entry_boot_id is non-null".into(),
+            ));
+        }
     }
 
     // Object count bounds
@@ -885,7 +964,9 @@ pub fn verify_header(header: &Header, file_size: u64, writable: bool) -> Result<
     // systemd: journal-file.c:667-668
     //   if (n_objects > arena_size / offsetof(ObjectHeader, payload))
     // DIVERGENCE FIX (D37): previous version didn't check n_objects upper bound.
-    if arena_size > 0 && n_objects > arena_size / OBJECT_HEADER_SIZE as u64 {
+    // BUG FIX: removed `arena_size > 0 &&` guard so that n_objects > 0 is correctly
+    // rejected when arena_size == 0 (division yields 0, and any n_objects > 0 is invalid).
+    if n_objects > arena_size / OBJECT_HEADER_SIZE as u64 {
         return Err(Error::InvalidFile(format!(
             "n_objects ({}) impossibly large for arena_size ({})",
             n_objects, arena_size
@@ -963,6 +1044,15 @@ pub fn verify_header(header: &Header, file_size: u64, writable: bool) -> Result<
             return Err(Error::InvalidFile(
                 "writable mode but field hash table is empty".into(),
             ));
+        }
+        // systemd: journal-file.c:699-707 — machine_id check for writable files.
+        // The file's machine_id must match the current machine_id, or be zeroed.
+        if let Some(mid) = current_machine_id {
+            if header.machine_id != [0u8; 16] && header.machine_id != mid {
+                return Err(Error::InvalidFile(
+                    "journal file machine_id does not match current machine".into(),
+                ));
+            }
         }
     }
 
@@ -1169,6 +1259,10 @@ pub struct JournalWriter {
     /// Whether this writer is currently in the online state.
     /// Used by journal_file_set_online to avoid redundant writes.
     online: bool,
+
+    /// Whether this file has been archived (journal_file_archive was called).
+    /// When true, Drop writes STATE_ARCHIVED instead of STATE_OFFLINE.
+    archived: bool,
 
     // Previous boot_id for monotonic ordering checks
     prev_boot_id: [u8; 16],
@@ -1386,6 +1480,7 @@ impl JournalWriter {
             },
             path: None,
             online: true,
+            archived: false,
             prev_boot_id: [0u8; 16],
             data_index: HashMap::new(),
             field_index: HashMap::new(),
@@ -1412,21 +1507,13 @@ impl JournalWriter {
         // skipped verify_header. We are a WRITER, so must check SUPPORTED_WRITE
         // and do full verification.
         let file_size = file.metadata()?.len();
-        verify_header(&h, file_size, true)?;
-
-        // systemd: journal-file.c:699-707 — machine_id check for writable files.
-        // The file's machine_id must match the current machine_id, or be zeroed.
-        // On non-Linux, machine_id() returns a random value, so we skip the check
-        // if the current machine_id cannot be read from /etc/machine-id.
+        // On Linux, pass the current machine_id so verify_header can check it.
+        // On non-Linux, machine_id() returns a random value, so skip the check.
         #[cfg(target_os = "linux")]
-        {
-            let current_mid = machine_id();
-            if h.machine_id != [0u8; 16] && h.machine_id != current_mid {
-                return Err(Error::InvalidFile(
-                    "journal file machine_id does not match current machine".into(),
-                ));
-            }
-        }
+        let mid = Some(machine_id());
+        #[cfg(not(target_os = "linux"))]
+        let mid: Option<[u8; 16]> = None;
+        verify_header(&h, file_size, true, mid)?;
 
         let offset = from_le64(&h.header_size) + from_le64(&h.arena_size);
         let data_ht_offset =
@@ -1510,6 +1597,7 @@ impl JournalWriter {
             compression: compression_requested(),
             path: None,
             online: true,
+            archived: false,
             prev_boot_id: h.tail_entry_boot_id,
             data_index,
             field_index,
@@ -1553,6 +1641,23 @@ impl JournalWriter {
         let realtime = realtime_now();
         let monotonic = monotonic_now();
         let boot_id = self.boot_id;
+
+        // systemd: journal-file.c:2551-2558
+        // Validate timestamps: VALID_REALTIME(u) = u > 0 && u < (1<<55)
+        //                      VALID_MONOTONIC(u) = u < (1<<55)
+        const TS_UPPER: u64 = 1u64 << 55;
+        if realtime == 0 || realtime >= TS_UPPER {
+            return Err(Error::InvalidFile(format!(
+                "invalid realtime timestamp {}",
+                realtime
+            )));
+        }
+        if monotonic >= TS_UPPER {
+            return Err(Error::InvalidFile(format!(
+                "invalid monotonic timestamp {}",
+                monotonic
+            )));
+        }
 
         // systemd: journal-file.c:2546-2558
         // Validate timestamps: realtime must be >= previous, monotonic >= previous if same boot
@@ -1818,9 +1923,18 @@ impl JournalWriter {
             }
         }
 
-        // systemd: journal-file.c:4400 — set archive flag, keep state ONLINE
-        // so that proper offlining occurs (fsync before state change)
+        // systemd: journal-file.c:4400 — set archive flag so Drop writes
+        // STATE_ARCHIVED instead of STATE_OFFLINE.
         self.online = true; // keep online so Drop does proper offline sequence
+        self.archived = true;
+
+        // fsync the parent directory after rename to ensure the directory
+        // entry is persisted (systemd: fsync_directory_of_file).
+        if let Some(parent) = std::path::Path::new(&new_path).parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
 
         // Update stored path to new name
         self.path = Some(new_path);
@@ -1872,6 +1986,7 @@ impl JournalWriter {
     /// Spawn a background thread that fsyncs the file data and transitions the
     /// header state to OFFLINE. The state machine allows cancellation if a new
     /// write comes in during the offline transition (see `journal_file_set_online`).
+    #[allow(dead_code)]
     fn journal_file_set_offline(&mut self) -> Result<()> {
         self.journal_file_set_offline_thread_join()?;
 
@@ -1938,6 +2053,13 @@ impl JournalWriter {
         /// systemd: journal-file.c:797-799 — compact mode max (offsets are 32-bit).
         const JOURNAL_COMPACT_SIZE_MAX: u64 = u32::MAX as u64; // 4 GB
 
+        // Overflow check: offset + size must not wrap around
+        if size > u64::MAX - offset {
+            return Err(Error::InvalidFile(format!(
+                "offset + size overflow ({} + {})",
+                offset, size
+            )));
+        }
         let new_end = offset + size;
 
         // systemd: journal-file.c:794-795 — max_size check
@@ -1999,6 +2121,12 @@ impl JournalWriter {
         {
             self.file.set_len(new_size)?;
         }
+
+        // Update arena_size in the header after successful allocation.
+        // arena_size = file_size - header_size; the arena starts right after the header.
+        // The arena_size field is at offset 96 in the on-disk Header struct.
+        const ARENA_SIZE_OFFSET: u64 = 96;
+        self.write_u64_at(ARENA_SIZE_OFFSET, new_size - HEADER_SIZE)?;
 
         Ok(())
     }
@@ -2362,7 +2490,16 @@ impl JournalWriter {
             };
             let obj_size = self.read_u64_at(off + 8)?;
             let poffset = data_payload_offset(self.compact);
-            let payload_len = obj_size.saturating_sub(poffset);
+            if obj_size < poffset {
+                return Err(Error::CorruptObject {
+                    offset: *off,
+                    reason: format!(
+                        "data object size {} smaller than payload offset {}",
+                        obj_size, poffset
+                    ),
+                });
+            }
+            let payload_len = obj_size - poffset;
 
             let compressed_flags = flags_byte & obj_flags::COMPRESSED_MASK;
             if compressed_flags != 0 {
@@ -2558,7 +2695,7 @@ impl JournalWriter {
         }
 
         // systemd: journal-file.c:1884-1894 — attempt compression for payloads > 512 bytes
-        let (final_payload, compress_flag, incompat_flag) = if payload.len() > 512 {
+        let (final_payload, compress_flag, incompat_flag) = if payload.len() >= 512 {
             self.try_compress_payload(payload)
         } else {
             (payload.to_vec(), 0u8, 0u32)
@@ -2845,9 +2982,19 @@ impl JournalWriter {
             self.write_u64_at(first_offset_ptr, head_arr)?;
         }
 
-        // Update cache
+        // Update cache and write compact tail fields to disk
         if let Some(t) = tail {
             self.data_tail_cache.insert(data_offset, t);
+
+            // In compact mode, write tail_entry_array_offset (le32 at +64)
+            // and tail_entry_array_n_entries (le32 at +68) back to the DATA object.
+            if self.compact {
+                let tail_arr_off = t.0 as u32;
+                let tail_arr_n = t.1 as u32;
+                self.file.seek(SeekFrom::Start(data_offset + 64))?;
+                self.file.write_all(&tail_arr_off.to_le_bytes())?;
+                self.file.write_all(&tail_arr_n.to_le_bytes())?;
+            }
         }
 
         self.write_u64_at(n_entries_ptr, n_entries + 1)?;
@@ -3134,8 +3281,11 @@ impl JournalWriter {
         // The ftruncate to the file's OWN size is a no-op size-wise but triggers
         // inotify IN_MODIFY for watchers.
         self.file.flush()?;
-        let actual_size = self.file.metadata()?.len();
-        self.file.set_len(actual_size)?;
+        // systemd silently ignores ftruncate failures (logged but not propagated).
+        // Use .ok() so a non-fatal ftruncate error doesn't abort an append operation.
+        if let Ok(actual_size) = self.file.metadata().map(|m| m.len()) {
+            let _ = self.file.set_len(actual_size);
+        }
 
         // Invoke the post-change callback if set, with optional coalescing.
         if let Some(ref mut cb) = self.post_change_callback {
@@ -3189,22 +3339,70 @@ impl JournalWriter {
     /// systemd: journal-file.c:4580-4618 journal_file_get_cutoff_monotonic_usec
     ///
     /// Get the monotonic timestamp range for a given boot_id.
-    /// For the simple case (single boot), returns the range if boot_id matches.
+    /// Looks up the `_BOOT_ID=<hex>` DATA object, reads the first entry's
+    /// monotonic timestamp from the inline entry_offset, then walks the
+    /// entry array chain to find the last entry's monotonic timestamp.
     /// Returns None if no entries match or no entries exist.
     pub fn journal_file_get_cutoff_monotonic_usec(
-        &self,
+        &mut self,
         boot_id: &[u8; 16],
     ) -> Option<(u64, u64)> {
         if self.n_entries == 0 {
             return None;
         }
-        // In our simple implementation, we only track the tail monotonic.
-        // If the boot_id matches the current boot, return (0, tail_monotonic).
-        if *boot_id == self.boot_id {
-            Some((0, self.tailentry_monotonic))
-        } else {
-            None
+        let boot_id_hex = boot_id.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let boot_data = format!("_BOOT_ID={}", boot_id_hex);
+        let h = journal_file_hash_data(boot_data.as_bytes(), self.keyed_hash, &self.file_id);
+        let data_offset = match self.journal_file_find_data_object_with_hash(boot_data.as_bytes(), h) { Ok(Some(off)) => off, _ => return None, };
+        let n_entries = match self.read_u64_at(data_offset + 56) { Ok(n) => n, Err(_) => return None, };
+        if n_entries == 0 { return None; }
+        let feo = match self.read_u64_at(data_offset + 40) { Ok(off) if off > 0 => off, _ => return None, };
+        let from = match self.read_u64_at(feo + 32) { Ok(ts) => ts, Err(_) => return None, };
+        let to = match self.get_last_entry_monotonic_for_data(data_offset, n_entries) { Ok(ts) => ts, Err(_) => return None, };
+        Some((from, to))
+    }
+
+    /// Walk the entry array chain for a DATA object to find the last entry's
+    /// monotonic timestamp (mirrors DIRECTION_UP in journal_file_move_to_entry_for_data).
+    fn get_last_entry_monotonic_for_data(&mut self, data_offset: u64, n_entries: u64) -> Result<u64> {
+        if n_entries == 1 {
+            let eo = self.read_u64_at(data_offset + 40)?;
+            return self.read_u64_at(eo + 32);
         }
+        let eao = self.read_u64_at(data_offset + 48)?;
+        if eao == 0 {
+            let eo = self.read_u64_at(data_offset + 40)?;
+            return self.read_u64_at(eo + 32);
+        }
+        let item_sz = entry_array_item_size(self.compact);
+        let mut remaining = n_entries - 1;
+        let mut a = eao;
+        let mut last_array = a;
+        let mut last_array_n = 0u64;
+        while a > 0 {
+            let obj_size = self.read_u64_at(a + 8)?;
+            let k = entry_array_n_items(obj_size, self.compact);
+            if k == 0 { break; }
+            last_array = a;
+            if remaining <= k { last_array_n = remaining; break; }
+            remaining -= k;
+            last_array_n = k;
+            a = self.read_u64_at(a + OBJECT_HEADER_SIZE as u64)?;
+        }
+        if last_array_n > 0 {
+            let slot_off = last_array + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + (last_array_n - 1) * item_sz;
+            let eo = if self.compact {
+                self.file.seek(SeekFrom::Start(slot_off))?;
+                let mut buf = [0u8; 4];
+                self.file.read_exact(&mut buf)?;
+                u32::from_le_bytes(buf) as u64
+            } else {
+                self.read_u64_at(slot_off)?
+            };
+            if eo > 0 { return self.read_u64_at(eo + 32); }
+        }
+        let eo = self.read_u64_at(data_offset + 40)?;
+        self.read_u64_at(eo + 32)
     }
 
     /// systemd: journal-file.c:4620-4712 journal_file_rotate_suggested
@@ -3292,7 +3490,15 @@ impl JournalWriter {
         &mut self,
         source: &mut JournalWriter,
         entry_offset: u64,
+        machine_id_override: Option<&[u8; 16]>,
     ) -> Result<u64> {
+        // If caller provides a machine_id, set it on self so that
+        // append_entry_internal doesn't read /etc/machine-id.
+        if let Some(mid) = machine_id_override {
+            if self.machine_id == [0u8; 16] {
+                self.machine_id = *mid;
+            }
+        }
         let entry_size = source.read_u64_at(entry_offset + 8)?;
         let realtime = source.read_u64_at(entry_offset + 24)?;
         let monotonic = source.read_u64_at(entry_offset + 32)?;
@@ -3348,7 +3554,33 @@ impl JournalWriter {
             }
 
             // Read raw payload from source (the full "FIELD=value" bytes).
-            let payload = source.journal_file_data_payload(data_offset)?;
+            // Corruption tolerance: skip items whose DATA object is corrupt
+            // (mirrors systemd's EBADMSG/EADDRNOTAVAIL tolerance).
+            let payload = match source.journal_file_data_payload(data_offset) {
+                Ok(p) => p,
+                Err(Error::CorruptObject { offset, reason }) => {
+                    eprintln!(
+                        "copy_entry: skipping corrupt DATA object at {:#x}: {}",
+                        offset, reason
+                    );
+                    continue;
+                }
+                Err(Error::Decompression(msg)) => {
+                    eprintln!(
+                        "copy_entry: skipping DATA at {:#x} with decompression error: {}",
+                        data_offset, msg
+                    );
+                    continue;
+                }
+                Err(Error::Truncated { offset }) => {
+                    eprintln!(
+                        "copy_entry: skipping truncated DATA object at {:#x}",
+                        offset
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let h = journal_file_hash_data(&payload, self.keyed_hash, &self.file_id);
             // systemd: C:4497-4500 — keyed_hash uses jenkins for xor_hash (cursor stability)
             if self.keyed_hash {
@@ -3770,12 +4002,15 @@ impl Drop for JournalWriter {
 
         let _ = self.write_header();
         if let Ok(mut h) = self.read_header_raw() {
-            // Don't overwrite ARCHIVED state with Offline
-            if h.state != FileState::Archived as u8 {
+            // Write STATE_ARCHIVED if journal_file_archive was called,
+            // otherwise STATE_OFFLINE.
+            if self.archived {
+                h.state = FileState::Archived as u8;
+            } else if h.state != FileState::Archived as u8 {
                 h.state = FileState::Offline as u8;
-                let _ = self.file.seek(SeekFrom::Start(0));
-                let _ = self.file.write_all(header_as_bytes(&h));
             }
+            let _ = self.file.seek(SeekFrom::Start(0));
+            let _ = self.file.write_all(header_as_bytes(&h));
         }
         // DIVERGENCE FIX: use sync_all() not just flush().
         // systemd: fsync_full(f->fd) during offlining.
@@ -3804,7 +4039,7 @@ fn build_header(
     file_id: [u8; 16],
     machine_id: [u8; 16],
     seqnum_id: [u8; 16],
-    boot_id: [u8; 16],
+    _boot_id: [u8; 16],
     header_size: u64,
     arena_size: u64,
     data_ht_offset: u64,
@@ -3840,7 +4075,7 @@ fn build_header(
         data_hash_table_size: le64(data_ht_size - OBJECT_HEADER_SIZE as u64),
         field_hash_table_offset: le64(field_ht_offset + OBJECT_HEADER_SIZE as u64),
         field_hash_table_size: le64(field_ht_size - OBJECT_HEADER_SIZE as u64),
-        tail_object_offset: le64(0),
+        tail_object_offset: le64(field_ht_offset),
         n_objects: le64(2),
         n_entries: le64(0),
         tail_entry_seqnum: le64(0),
@@ -4037,16 +4272,35 @@ fn rebuild_indexes(
 // Archive / dispose / UID parsing
 // ══════════════════════════════════════════════════════════════════════════
 
-/// systemd: journal-file.c:4225-4280 journal_file_dispose
+/// systemd: journal-file.c:4405-4428 journal_file_dispose
 ///
-/// Dispose of a journal file: punch holes to free space, then unlink.
-/// On Linux, opens the file, uses `fallocate(FALLOC_FL_PUNCH_HOLE)` to free
-/// blocks, then unlinks. On non-Linux, just unlinks.
+/// Dispose of a journal file: punch holes to free space as a best-effort
+/// optimization, then rename to `{base}@{realtime:016x}-{random:08x}.journal~`
+/// to preserve the (possibly corrupt) file for inspection. This matches
+/// systemd's behavior of never unlinking journal files outright.
+///
+/// The `_dir_fd` parameter is accepted for API compatibility with the systemd
+/// signature (which uses `dir_fd` for `renameat`), but is currently ignored
+/// because Rust's `std::fs::rename` operates on full paths. If directory-fd
+/// based renaming is needed in the future, it can be implemented via
+/// `libc::renameat`.
 pub fn journal_file_dispose(_dir_fd: Option<i32>, path: &str) -> Result<()> {
+    let p = std::path::Path::new(path);
+
+    // Strip the ".journal" suffix to get the base name for the renamed file.
+    let file_name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::InvalidFile("dispose: cannot extract filename".into()))?;
+
+    let base = file_name
+        .strip_suffix(".journal")
+        .ok_or_else(|| Error::InvalidFile("dispose: path does not end in .journal".into()))?;
+
+    // Best-effort hole punching on Linux to release disk blocks before rename.
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
-        // Open the file to punch holes before unlinking
         if let Ok(file) = File::open(path) {
             if let Ok(meta) = file.metadata() {
                 let size = meta.len();
@@ -4064,7 +4318,31 @@ pub fn journal_file_dispose(_dir_fd: Option<i32>, path: &str) -> Result<()> {
             }
         }
     }
-    std::fs::remove_file(path)?;
+
+    // Generate random suffix: read 4 bytes from /dev/urandom (matching
+    // systemd's random_u64, truncated to u32 for the filename format).
+    let random_suffix: u32 = {
+        use std::io::Read;
+        let mut buf = [0u8; 4];
+        if let Ok(mut f) = File::open("/dev/urandom") {
+            let _ = f.read_exact(&mut buf);
+        }
+        u32::from_ne_bytes(buf)
+    };
+
+    let rt = realtime_now();
+
+    // Construct the new name: {base}@{realtime:016x}-{random:08x}.journal~
+    let new_name = format!("{}@{:016x}-{:08x}.journal~", base, rt, random_suffix);
+    let new_path = p.with_file_name(&new_name);
+
+    std::fs::rename(path, &new_path).map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("dispose: failed to rename {:?} to {:?}: {}", path, new_path, e),
+        ))
+    })?;
+
     Ok(())
 }
 
@@ -4246,15 +4524,16 @@ mod tests {
             ObjectType::Data as u8,
             DATA_OBJECT_HEADER_SIZE as u64 + 10,
             0,
-            false
+            false,
+            None
         )
         .is_ok());
     }
 
     #[test]
     fn test_check_object_header_invalid_type() {
-        assert!(check_object_header(0, 100, 0, false).is_err());
-        assert!(check_object_header(99, 100, 0, false).is_err());
+        assert!(check_object_header(0, 100, 0, false, None).is_err());
+        assert!(check_object_header(99, 100, 0, false, None).is_err());
     }
 
     #[test]
@@ -4263,7 +4542,8 @@ mod tests {
             ObjectType::Entry as u8,
             OBJECT_HEADER_SIZE as u64,
             0,
-            false
+            false,
+            None
         )
         .is_err());
     }
@@ -4328,7 +4608,7 @@ mod tests {
         w.flush().unwrap();
         let h = w.read_header_raw().unwrap();
         let file_size = w.offset;
-        assert!(verify_header(&h, file_size, true).is_ok());
+        assert!(verify_header(&h, file_size, true, None).is_ok());
         drop(w);
     }
 
@@ -4369,7 +4649,7 @@ mod tests {
             tail_entry_array_n_entries: le32(0),
             tail_entry_offset: le64(0),
         };
-        assert!(verify_header(&h, 1024, false).is_err());
+        assert!(verify_header(&h, 1024, false, None).is_err());
     }
 
     #[test]
@@ -4633,7 +4913,7 @@ mod tests {
         src.flush().unwrap();
 
         let mut dst = JournalWriter::open(&dst_path).unwrap();
-        dst.journal_file_copy_entry(&mut src, entry_off).unwrap();
+        dst.journal_file_copy_entry(&mut src, entry_off, None).unwrap();
         dst.flush().unwrap();
 
         assert_eq!(dst.n_entries(), 1);

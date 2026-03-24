@@ -16,10 +16,10 @@ use sha2::Sha256;
 
 use crate::def::{
     Header, ObjectType, OBJECT_HEADER_SIZE,
-    DATA_OBJECT_HEADER_SIZE, ENTRY_OBJECT_HEADER_SIZE,
-    FIELD_OBJECT_HEADER_SIZE,
+    ENTRY_OBJECT_HEADER_SIZE, FIELD_OBJECT_HEADER_SIZE,
 };
 use crate::fsprg;
+use crate::writer::data_payload_offset;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -161,6 +161,7 @@ pub fn journal_file_hmac_put_object(
     obj_type: ObjectType,
     obj_data: &[u8],
     _offset: u64,
+    compact: bool,
 ) -> Result<(), &'static str> {
     let hmac = match state.hmac.as_mut() {
         Some(h) => h,
@@ -182,14 +183,16 @@ pub fn journal_file_hmac_put_object(
             // Feed: hash (8 bytes at offset 16) then payload.
             // Skip: next_hash_offset, next_field_offset, entry_offset,
             //        entry_array_offset, n_entries (5 * 8 = 40 bytes).
-            if obj_size < DATA_OBJECT_HEADER_SIZE {
+            // In compact mode, payload starts 8 bytes later (72 vs 64).
+            let payload_off = data_payload_offset(compact) as usize;
+            if obj_size < payload_off {
                 return Err("DATA object too small");
             }
             // hash is at offset 16, 8 bytes
             hmac.update(&obj_data[OBJECT_HEADER_SIZE..OBJECT_HEADER_SIZE + 8]);
-            // payload starts after the full DataObjectHeader (64 bytes)
-            if obj_size > DATA_OBJECT_HEADER_SIZE {
-                hmac.update(&obj_data[DATA_OBJECT_HEADER_SIZE..]);
+            // payload starts after data_payload_offset (64 normal, 72 compact)
+            if obj_size > payload_off {
+                hmac.update(&obj_data[payload_off..]);
             }
         }
 
@@ -239,13 +242,36 @@ pub fn journal_file_hmac_put_object(
 
 /// Finalise the current HMAC cycle and return the 32-byte tag.
 ///
-/// Matches the tag-extraction part of `journal_file_append_tag()`.
-pub fn journal_file_append_tag(state: &mut JournalHmac) -> [u8; TAG_LENGTH] {
+/// Matches `journal_file_append_tag()` (journal-authenticate.c:44-88).
+/// The C version feeds the tag object's header, seqnum and epoch into the
+/// HMAC before extracting the digest. We do the same: the caller provides
+/// the complete on-disk tag object bytes (header + seqnum + epoch + space
+/// for the tag itself, i.e. 64 bytes) so that we can HMAC the immutable
+/// portions before finalising.
+pub fn journal_file_append_tag(
+    state: &mut JournalHmac,
+    tag_object: &[u8],
+) -> [u8; TAG_LENGTH] {
     let hmac = state
         .hmac
-        .take()
+        .as_mut()
         .expect("journal_file_append_tag called without active HMAC");
 
+    // Feed the tag object's immutable fields into the HMAC before
+    // finalising, matching journal-authenticate.c:73-74:
+    //   journal_file_hmac_put_object(f, OBJECT_TAG, o, p);
+    // ObjectHeader (16 bytes) + seqnum (8) + epoch (8) = 32 bytes.
+    let tag_fixed_end = OBJECT_HEADER_SIZE + 8 + 8; // 32
+    assert!(
+        tag_object.len() >= tag_fixed_end,
+        "tag_object too small for TAG header + seqnum + epoch"
+    );
+    // Feed the object header
+    hmac.update(&tag_object[..OBJECT_HEADER_SIZE]);
+    // Feed seqnum + epoch (skip the tag hash bytes themselves)
+    hmac.update(&tag_object[OBJECT_HEADER_SIZE..tag_fixed_end]);
+
+    let hmac = state.hmac.take().unwrap();
     let result = hmac.finalize();
     let tag_bytes = result.into_bytes();
 
@@ -319,6 +345,35 @@ pub fn journal_file_fss_load(path: &Path) -> io::Result<FssState> {
             io::ErrorKind::InvalidData,
             "FSS start_usec or interval_usec is zero",
         ));
+    }
+
+    // Validate that the FSS key file's machine_id matches this machine.
+    // Matches journal-authenticate.c:415-416:
+    //   if (!sd_id128_equal(machine, m->fss_file->machine_id))
+    //       return -EHOSTDOWN;
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = fs::read_to_string("/etc/machine-id") {
+            let trimmed = s.trim().replace('-', "");
+            if trimmed.len() == 32 {
+                let mut local_id = [0u8; 16];
+                let mut valid = true;
+                for i in 0..16 {
+                    if let Ok(b) = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16) {
+                        local_id[i] = b;
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                if valid && local_id != header.machine_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "FSS key file machine_id does not match this machine",
+                    ));
+                }
+            }
+        }
     }
 
     let state_start = header_size as usize;
@@ -506,7 +561,9 @@ mod tests {
         // Feed some data
         hmac.hmac.as_mut().unwrap().update(b"test data");
 
-        let tag = journal_file_append_tag(&mut hmac);
+        // Build a minimal tag object: ObjectHeader(16) + seqnum(8) + epoch(8) + tag_space(32) = 64
+        let tag_object = [0u8; 64];
+        let tag = journal_file_append_tag(&mut hmac, &tag_object);
         assert_eq!(tag.len(), TAG_LENGTH);
         assert!(!hmac.running);
     }
