@@ -20,7 +20,10 @@
 // secret key, done offline).  Neither operation is typically exposed to a
 // network attacker in a timing-oracle scenario.  `BigUint` also does not
 // implement `Zeroize`, so its internal heap allocations are freed but not
-// zeroed on drop — a limitation shared with libgcrypt's `gcry_mpi_release`.
+// zeroed on drop.  Note that libgcrypt's `gcry_mpi_release` does wipe limb
+// data via `wipememory()` before freeing, so this is a regression from the
+// C implementation.  A future improvement could use `crypto-bigint` (which
+// supports zeroization) at the cost of fixed-width integer refactoring.
 
 /// Recommended security parameter (bit length of the RSA modulus).
 pub const FSPRG_RECOMMENDED_SECPAR: u32 = 1536;
