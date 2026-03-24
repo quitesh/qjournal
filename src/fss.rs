@@ -13,6 +13,7 @@ use std::path::Path;
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::def::{
     Header, ObjectType, OBJECT_HEADER_SIZE,
@@ -65,9 +66,12 @@ pub struct JournalHmac {
 }
 
 /// State loaded from a `.fss` key file.
+///
+/// The FSPRG state contains secret key material and is wrapped in
+/// `Zeroizing` to ensure it is zeroed on drop.
 pub struct FssState {
     pub header: FssHeader,
-    pub fsprg_state: Vec<u8>,
+    pub fsprg_state: Zeroizing<Vec<u8>>,
     pub start_usec: u64,
     pub interval_usec: u64,
 }
@@ -323,7 +327,7 @@ pub fn journal_file_fss_load(path: &Path) -> io::Result<FssState> {
 
     let state_start = header_size as usize;
     let state_end = total as usize;
-    let fsprg_state = data[state_start..state_end].to_vec();
+    let fsprg_state = Zeroizing::new(data[state_start..state_end].to_vec());
 
     Ok(FssState {
         header,
@@ -344,12 +348,13 @@ pub fn journal_file_fss_load(path: &Path) -> io::Result<FssState> {
 /// `INTERVAL_HEX` is the interval in microseconds. The actual
 /// `start_usec` is computed as `start * interval`.
 ///
-/// Returns `(seed, start_usec, interval_usec)`.
+/// Returns `(seed, start_usec, interval_usec)`.  The seed is wrapped in
+/// `Zeroizing` as it is secret verification material.
 ///
 /// Matches `journal_file_parse_verification_key()`.
 pub fn journal_file_parse_verification_key(
     key_str: &str,
-) -> Result<(Vec<u8>, u64, u64), &'static str> {
+) -> Result<(Zeroizing<Vec<u8>>, u64, u64), &'static str> {
     let slash_pos = key_str
         .rfind('/')
         .ok_or("verification key missing '/'")?;
@@ -359,7 +364,7 @@ pub fn journal_file_parse_verification_key(
 
     // Parse hex seed (dashes are allowed separators, skip them).
     let seed_size = FSPRG_RECOMMENDED_SEEDLEN;
-    let mut seed = Vec::with_capacity(seed_size);
+    let mut seed = Zeroizing::new(Vec::with_capacity(seed_size));
     let mut chars = hex_part.chars().filter(|&c| c != '-');
 
     for _ in 0..seed_size {
@@ -488,7 +493,7 @@ mod tests {
         // 12-byte seed = 24 hex chars, with optional dashes
         let key = "0102030405060708090a0b0c/a-3e8";
         let (seed, start_usec, interval_usec) = journal_file_parse_verification_key(key).unwrap();
-        assert_eq!(seed, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(&*seed, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         // start=0xa=10, interval=0x3e8=1000, start_usec = 10*1000 = 10000
         assert_eq!(start_usec, 10000);
         assert_eq!(interval_usec, 1000);

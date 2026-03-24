@@ -43,9 +43,11 @@ fn is_valid_secpar(secpar: u32) -> bool {
 #[cfg(feature = "fss")]
 mod inner {
     use num_bigint::BigUint;
-    use num_integer::Integer;
     use num_traits::{One, Zero};
+    use rand::rngs::OsRng;
+    use rand::RngCore;
     use sha2::{Digest, Sha256};
+    use zeroize::Zeroizing;
 
     use super::*;
 
@@ -133,72 +135,21 @@ mod inner {
     // -----------------------------------------------------------------------
 
     fn genprime3mod4(bits: u32, seed: &[u8], idx: u32) -> BigUint {
+        use num_prime::nt_funcs::is_prime;
+
         let buflen = bits as usize / 8;
         assert!(bits % 8 == 0 && buflen > 0);
 
-        let mut buf = vec![0u8; buflen];
+        let mut buf = Zeroizing::new(vec![0u8; buflen]);
         det_randomize(&mut buf, seed, idx);
         buf[0] |= 0xc0; // set upper two bits so n = p*q has maximum size
         buf[buflen - 1] |= 0x03; // set lower two bits to ensure ≡ 3 (mod 4)
 
         let mut p = mpi_import(&buf);
-        while !is_probably_prime(&p) {
+        while !is_prime(&p, None).probably() {
             p += 4u32;
         }
         p
-    }
-
-    /// Miller-Rabin primality test with 25 rounds.
-    fn is_probably_prime(n: &BigUint) -> bool {
-        let one = BigUint::one();
-        let two = &one + &one;
-        let three = &two + &one;
-
-        if *n < two {
-            return false;
-        }
-        if *n == two || *n == three {
-            return true;
-        }
-        if n.is_even() {
-            return false;
-        }
-
-        // Write n-1 as 2^r * d
-        let n_minus_1 = n - &one;
-        let mut d = n_minus_1.clone();
-        let mut r: u32 = 0;
-        while d.is_even() {
-            d >>= 1;
-            r += 1;
-        }
-
-        // Deterministic witnesses: use small primes as bases.
-        // For numbers up to ~768 bits (our half-secpar), 25 rounds with
-        // small-prime bases gives overwhelming confidence.
-        let witnesses: [u32; 25] = [
-            2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61,
-            67, 71, 73, 79, 83, 89, 97,
-        ];
-
-        'outer: for &a in &witnesses {
-            let a = BigUint::from(a);
-            if a >= *n {
-                continue;
-            }
-            let mut x = a.modpow(&d, n);
-            if x == one || x == n_minus_1 {
-                continue;
-            }
-            for _ in 0..r - 1 {
-                x = x.modpow(&two, n);
-                if x == n_minus_1 {
-                    continue 'outer;
-                }
-            }
-            return false;
-        }
-        true
     }
 
     // -----------------------------------------------------------------------
@@ -207,7 +158,7 @@ mod inner {
 
     fn gensquare(n: &BigUint, seed: &[u8], idx: u32, secpar: u32) -> BigUint {
         let buflen = secpar as usize / 8;
-        let mut buf = vec![0u8; buflen];
+        let mut buf = Zeroizing::new(vec![0u8; buflen]);
         det_randomize(&mut buf, seed, idx);
         buf[0] &= 0x7f; // clear upper bit so x < n
         let x = mpi_import(&buf);
@@ -314,21 +265,22 @@ mod inner {
 
     /// Generate master key pair (msk, mpk) from seed.
     ///
-    /// If seed is None, generates a random seed using the system CSPRNG.
+    /// If seed is None, generates a random seed using the OS CSPRNG.
+    /// The master secret key is wrapped in `Zeroizing` to ensure it is
+    /// zeroed on drop.
     pub fn gen_mk(
         seed: Option<&[u8]>,
         secpar: u32,
-    ) -> (Vec<u8>, Vec<u8>) {
+    ) -> (Zeroizing<Vec<u8>>, Vec<u8>) {
         assert!(is_valid_secpar(secpar));
 
         let owned_seed;
         let seed = match seed {
             Some(s) => s,
             None => {
-                use rand::RngCore;
                 owned_seed = {
-                    let mut buf = vec![0u8; FSPRG_RECOMMENDED_SEEDLEN];
-                    rand::thread_rng().fill_bytes(&mut buf);
+                    let mut buf = Zeroizing::new(vec![0u8; FSPRG_RECOMMENDED_SEEDLEN]);
+                    OsRng.fill_bytes(&mut buf);
                     buf
                 };
                 &owned_seed
@@ -343,7 +295,7 @@ mod inner {
 
         // msk = [secpar_header(2)][p(half/8)][q(half/8)]
         let msk_len = mskinbytes(secpar);
-        let mut msk = vec![0u8; msk_len];
+        let mut msk = Zeroizing::new(vec![0u8; msk_len]);
         store_secpar(&mut msk[0..2], secpar16);
         mpi_export(&mut msk[2..2 + half / 8], &p);
         mpi_export(&mut msk[2 + half / 8..2 + 2 * half / 8], &q);
@@ -359,7 +311,9 @@ mod inner {
     }
 
     /// Generate initial state (epoch 0) from master public key and seed.
-    pub fn gen_state0(mpk: &[u8], seed: &[u8]) -> Vec<u8> {
+    ///
+    /// The state contains secret material (x) and is wrapped in `Zeroizing`.
+    pub fn gen_state0(mpk: &[u8], seed: &[u8]) -> Zeroizing<Vec<u8>> {
         let secpar = read_secpar(mpk) as u32;
         let n_len = secpar as usize / 8;
 
@@ -367,7 +321,7 @@ mod inner {
         let x = gensquare(&n, seed, RND_GEN_X, secpar);
 
         let state_len = stateinbytes(secpar);
-        let mut state = vec![0u8; state_len];
+        let mut state = Zeroizing::new(vec![0u8; state_len]);
 
         // Copy mpk header + n
         state[..2 + n_len].copy_from_slice(&mpk[..2 + n_len]);
@@ -449,14 +403,15 @@ mod inner {
     /// Derive a key of length `keylen` from the current state.
     ///
     /// The `idx` parameter allows deriving multiple independent keys from the
-    /// same state/epoch.
-    pub fn get_key(state: &[u8], keylen: usize, idx: u32) -> Vec<u8> {
+    /// same state/epoch.  The returned key is wrapped in `Zeroizing` to ensure
+    /// it is zeroed on drop.
+    pub fn get_key(state: &[u8], keylen: usize, idx: u32) -> Zeroizing<Vec<u8>> {
         let secpar = read_secpar(state) as usize;
         // seed for det_randomize is state[2..2 + 2*secpar/8 + 8] = n || x || epoch
         let seed_len = 2 * secpar / 8 + 8;
         let seed = &state[2..2 + seed_len];
 
-        let mut key = vec![0u8; keylen];
+        let mut key = Zeroizing::new(vec![0u8; keylen]);
         det_randomize(&mut key, seed, idx);
         key
     }
