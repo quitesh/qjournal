@@ -20,6 +20,10 @@ pub const DEFAULT_FIELD_HASH_TABLE_SIZE: usize = 1023;
 /// The header is always exactly 272 bytes (from `assert_cc` in journal-def.h).
 pub const HEADER_SIZE: u64 = 272;
 
+/// Minimum header size for reading older journal files.
+/// Corresponds to the offset of the n_data field (232 bytes).
+pub const HEADER_SIZE_MIN: u64 = 232;
+
 /// Objects and the header start must be 8-byte aligned.
 pub const ALIGN: u64 = 8;
 
@@ -50,10 +54,10 @@ pub mod incompat {
     pub const COMPRESSED_ZSTD: u32 = 1 << 3;
     pub const COMPACT:         u32 = 1 << 4;
     /// Mask of flags we support when writing.
-    /// We support KEYED_HASH (siphash24 keyed with file_id).
-    pub const SUPPORTED_WRITE: u32 = KEYED_HASH;
+    /// We support KEYED_HASH (siphash24 keyed with file_id) and COMPACT.
+    pub const SUPPORTED_WRITE: u32 = KEYED_HASH | COMPACT;
     /// Mask of flags we support when reading.
-    pub const SUPPORTED_READ: u32  = COMPRESSED_ZSTD | KEYED_HASH | COMPACT;
+    pub const SUPPORTED_READ: u32  = COMPRESSED_XZ | COMPRESSED_LZ4 | COMPRESSED_ZSTD | KEYED_HASH | COMPACT;
 }
 
 // ── Object types ─────────────────────────────────────────────────────────

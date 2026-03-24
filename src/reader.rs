@@ -8,7 +8,6 @@
 
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -17,6 +16,7 @@ use indexmap::IndexMap;
 use crate::{
     def::*,
     error::{Error, Result},
+    mmap_cache::MmapCache,
     writer::{
         check_object, check_object_header, data_payload_offset, entry_array_item_size,
         entry_item_size, entry_array_n_items, journal_file_hash_data, offset_is_valid,
@@ -101,7 +101,9 @@ impl JournalEntry {
 
 /// A read-only view of a systemd-journald `.journal` file.
 pub struct JournalReader {
+    #[allow(dead_code)]
     file: File,
+    mmap: MmapCache,
     header: Header,
     /// Whether the file uses keyed hash (siphash24 with file_id).
     keyed_hash: bool,
@@ -123,11 +125,15 @@ impl JournalReader {
     ///
     /// systemd: journal_file_open() read path
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
+        let mmap = MmapCache::new(&file)?;
 
-        let mut hbuf = [0u8; 272];
-        file.read_exact(&mut hbuf)
-            .map_err(|_| Error::Truncated { offset: 0 })?;
+        if mmap.len() < 272 {
+            return Err(Error::Truncated { offset: 0 });
+        }
+        let hbuf = mmap
+            .read_bytes(0, 272)
+            .ok_or(Error::Truncated { offset: 0 })?;
         let h: Header = unsafe { std::ptr::read_unaligned(hbuf.as_ptr() as *const Header) };
 
         let file_size = file.metadata()?.len();
@@ -143,6 +149,7 @@ impl JournalReader {
 
         Ok(Self {
             file,
+            mmap,
             keyed_hash,
             compact,
             data_ht_items,
@@ -169,24 +176,18 @@ impl JournalReader {
     // ══════════════════════════════════════════════════════════════════════
 
     fn read_u64_at(&mut self, offset: u64) -> Result<u64> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = [0u8; 8];
-        self.file.read_exact(&mut buf)?;
-        Ok(u64::from_le_bytes(buf))
+        self.mmap.read_u64(offset).ok_or(Error::Truncated { offset })
     }
 
     fn read_u32_at(&mut self, offset: u64) -> Result<u32> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = [0u8; 4];
-        self.file.read_exact(&mut buf)?;
-        Ok(u32::from_le_bytes(buf))
+        self.mmap.read_u32(offset).ok_or(Error::Truncated { offset })
     }
 
     fn read_bytes_at(&mut self, offset: u64, n: usize) -> Result<Vec<u8>> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; n];
-        self.file.read_exact(&mut buf)?;
-        Ok(buf)
+        self.mmap
+            .read_bytes(offset, n)
+            .map(|s| s.to_vec())
+            .ok_or(Error::Truncated { offset })
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -213,16 +214,11 @@ impl JournalReader {
         }
 
         // Read ObjectHeader (16 bytes)
-        let obj_type = {
-            self.file.seek(SeekFrom::Start(offset))?;
-            let mut buf = [0u8; 1];
-            self.file.read_exact(&mut buf)?;
-            buf[0]
-        };
+        let obj_type = self.mmap.read_u8(offset).ok_or(Error::Truncated { offset })?;
         let obj_size = self.read_u64_at(offset + 8)?;
 
         // check_object_header (includes type range + minimum size check)
-        check_object_header(obj_type, obj_size, offset)?;
+        check_object_header(obj_type, obj_size, offset, self.compact)?;
 
         // Type check
         if expected_type != ObjectType::Unused && obj_type != expected_type as u8 {
@@ -237,12 +233,7 @@ impl JournalReader {
 
         // Per-type validation (systemd: check_object, C:936-1086)
         // Read type-specific fields for validation
-        let flags = {
-            self.file.seek(SeekFrom::Start(offset + 1))?;
-            let mut buf = [0u8; 1];
-            self.file.read_exact(&mut buf)?;
-            buf[0]
-        };
+        let flags = self.mmap.read_u8(offset + 1).ok_or(Error::Truncated { offset })?;
 
         let otype = ObjectType::try_from(obj_type).unwrap_or(ObjectType::Unused);
         match otype {
@@ -254,7 +245,7 @@ impl JournalReader {
                 let n_ent = self.read_u64_at(offset + 56)?;
                 check_object(otype, obj_size, flags, offset, self.compact,
                     0, next_hash, next_field, entry_off, entry_arr, n_ent,
-                    0, 0, 0, &[0u8; 16], 0)?;
+                    0, 0, 0, &[0u8; 16], 0, 0)?;
             }
             ObjectType::Entry => {
                 let seqnum = self.read_u64_at(offset + 16)?;
@@ -265,15 +256,21 @@ impl JournalReader {
                 boot.copy_from_slice(&boot_bytes);
                 check_object(otype, obj_size, flags, offset, self.compact,
                     0, 0, 0, 0, 0, 0,
-                    seqnum, realtime, monotonic, &boot, 0)?;
+                    seqnum, realtime, monotonic, &boot, 0, 0)?;
             }
             ObjectType::EntryArray => {
                 let next = self.read_u64_at(offset + OBJECT_HEADER_SIZE as u64)?;
                 check_object(otype, obj_size, flags, offset, self.compact,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, &[0u8; 16], next)?;
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, &[0u8; 16], next, 0)?;
+            }
+            ObjectType::Tag => {
+                // Read epoch from offset+24 (16-byte ObjectHeader + 8-byte seqnum = epoch at +24)
+                let epoch = self.read_u64_at(offset + 24)?;
+                check_object(otype, obj_size, flags, offset, self.compact,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, &[0u8; 16], 0, epoch)?;
             }
             _ => {
-                // Field, HashTable, Tag, Unused — minimal validation already done by check_object_header
+                // Field, HashTable, Unused — minimal validation already done by check_object_header
             }
         }
 
@@ -373,12 +370,8 @@ impl JournalReader {
     /// systemd: journal-file.c:1999-2034 journal_file_data_payload
     fn read_data_payload_raw(&mut self, data_offset: u64) -> Result<Vec<u8>> {
         let obj_size = self.read_u64_at(data_offset + 8)?;
-        let flags_byte = {
-            self.file.seek(SeekFrom::Start(data_offset + 1))?;
-            let mut buf = [0u8; 1];
-            self.file.read_exact(&mut buf)?;
-            buf[0]
-        };
+        let flags_byte = self.mmap.read_u8(data_offset + 1)
+            .ok_or(Error::Truncated { offset: data_offset })?;
 
         let poffset = data_payload_offset(self.compact);
         if obj_size < poffset {
@@ -403,9 +396,48 @@ impl JournalReader {
                     "journal uses ZSTD compression but feature not enabled".into(),
                 ));
             }
+        } else if compressed & obj_flags::COMPRESSED_XZ != 0 {
+            #[cfg(feature = "xz-compression")]
+            {
+                use std::io::Read as _;
+                let mut decoder = xz2::read::XzDecoder::new(raw.as_slice());
+                let mut decompressed = Vec::new();
+                decoder
+                    .read_to_end(&mut decompressed)
+                    .map_err(|e| Error::Decompression(e.to_string()))?;
+                return Ok(decompressed);
+            }
+            #[cfg(not(feature = "xz-compression"))]
+            {
+                return Err(Error::InvalidFile(
+                    "journal uses XZ compression but feature not enabled".into(),
+                ));
+            }
+        } else if compressed & obj_flags::COMPRESSED_LZ4 != 0 {
+            #[cfg(feature = "lz4-compression")]
+            {
+                // systemd LZ4 format: first 8 bytes are le64 uncompressed size,
+                // followed by the LZ4 block-compressed data.
+                if raw.len() < 8 {
+                    return Err(Error::Decompression("LZ4 data too short".into()));
+                }
+                let uncompressed_size =
+                    u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
+                let compressed_data = &raw[8..];
+                let decompressed =
+                    lz4_flex::decompress(compressed_data, uncompressed_size)
+                        .map_err(|e| Error::Decompression(e.to_string()))?;
+                return Ok(decompressed);
+            }
+            #[cfg(not(feature = "lz4-compression"))]
+            {
+                return Err(Error::InvalidFile(
+                    "journal uses LZ4 compression but feature not enabled".into(),
+                ));
+            }
         } else if compressed != 0 {
             return Err(Error::InvalidFile(
-                "journal uses LZ4 or XZ compression which is not supported".into(),
+                "journal uses unknown compression".into(),
             ));
         }
 
@@ -1255,6 +1287,58 @@ impl JournalReader {
         self.generic_array_bisect_for_data(data_offset, monotonic, &test_monotonic, direction)
     }
 
+    /// systemd: journal-file.c:3674-3696 journal_file_move_to_entry_by_offset_for_data
+    pub fn move_to_entry_by_offset_for_data(
+        &mut self,
+        data_offset: u64,
+        p: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        let test_offset = |s: &mut Self, entry_p: u64, needle: u64| -> Result<i32> {
+            s.test_object_offset(entry_p, needle)
+        };
+        self.generic_array_bisect_for_data(data_offset, p, &test_offset, direction)
+    }
+
+    /// systemd: journal-file.c:3698-3720 journal_file_move_to_entry_by_seqnum_for_data
+    pub fn move_to_entry_by_seqnum_for_data(
+        &mut self,
+        data_offset: u64,
+        seqnum: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        let test_seqnum = |s: &mut Self, p: u64, needle: u64| -> Result<i32> {
+            s.test_object_seqnum(p, needle)
+        };
+        self.generic_array_bisect_for_data(data_offset, seqnum, &test_seqnum, direction)
+    }
+
+    /// systemd: journal-file.c:3722-3744 journal_file_move_to_entry_by_realtime_for_data
+    pub fn move_to_entry_by_realtime_for_data(
+        &mut self,
+        data_offset: u64,
+        realtime: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        let test_realtime = |s: &mut Self, p: u64, needle: u64| -> Result<i32> {
+            s.test_object_realtime(p, needle)
+        };
+        self.generic_array_bisect_for_data(data_offset, realtime, &test_realtime, direction)
+    }
+
+    /// systemd: journal-file.c:3746-3776 journal_file_move_to_entry_by_monotonic_for_data
+    pub fn move_to_entry_by_monotonic_for_data(
+        &mut self,
+        data_offset: u64,
+        monotonic: u64,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        let test_monotonic = |s: &mut Self, p: u64, needle: u64| -> Result<i32> {
+            s.test_object_monotonic(p, needle)
+        };
+        self.generic_array_bisect_for_data(data_offset, monotonic, &test_monotonic, direction)
+    }
+
     /// systemd: journal-file.c:3607-3672 journal_file_move_to_entry_for_data
     ///
     /// Get the first (Down) or last (Up) entry linked to a specific DATA object.
@@ -1390,6 +1474,34 @@ impl JournalReader {
         }
 
         Ok(results)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Utility APIs
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:4558-4578
+    ///
+    /// Return the realtime range of entries in this journal file, or None
+    /// if the file has no entries.
+    pub fn get_cutoff_realtime_usec(&self) -> Option<(u64, u64)> {
+        let head = from_le64(&self.header.head_entry_realtime);
+        let tail = from_le64(&self.header.tail_entry_realtime);
+        if head == 0 || tail == 0 {
+            None
+        } else {
+            Some((head, tail))
+        }
+    }
+
+    /// Return the number of entries in this journal file.
+    pub fn n_entries(&self) -> u64 {
+        self.n_entries
+    }
+
+    /// Return a reference to the file header.
+    pub fn header(&self) -> &Header {
+        &self.header
     }
 }
 

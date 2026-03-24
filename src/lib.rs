@@ -37,10 +37,22 @@
 
 pub mod def;
 pub mod error;
+#[cfg(feature = "fss")]
+pub mod fsprg;
+#[cfg(feature = "fss")]
+pub mod fss;
 pub mod hash;
+pub mod mmap_cache;
 pub mod reader;
+pub mod verify;
 pub mod writer;
 
 pub use error::{Error, Result};
 pub use reader::JournalReader;
-pub use writer::JournalWriter;
+pub use verify::{journal_file_verify, VerifyResult};
+pub use writer::{
+    Compression, JournalMetrics, JournalWriter,
+    compression_default, compression_requested,
+    journal_file_dispose, journal_file_parse_uid_from_filename,
+    journal_metrics_equal, journal_reset_metrics,
+};
