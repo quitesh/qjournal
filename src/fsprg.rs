@@ -55,7 +55,6 @@ fn is_valid_secpar(secpar: u32) -> bool {
 #[cfg(feature = "fss")]
 mod inner {
     use num_bigint::BigUint;
-    use num_integer::Integer;
     use num_traits::{One, Zero};
     use rand::rngs::OsRng;
     use rand::RngCore;
@@ -67,11 +66,6 @@ mod inner {
     const RND_GEN_P: u32 = 0x01;
     const RND_GEN_Q: u32 = 0x02;
     const RND_GEN_X: u32 = 0x03;
-
-    /// Number of additional random Miller-Rabin witnesses drawn from OsRng.
-    /// Combined with the 25 deterministic small-prime witnesses, this gives
-    /// a composite-passing probability of at most 4^(-15) ~ 10^(-9).
-    const RANDOM_WITNESS_ROUNDS: usize = 15;
 
     // -----------------------------------------------------------------------
     // MPI helpers (big-endian, unsigned, zero-padded on the left)
@@ -153,6 +147,8 @@ mod inner {
     // -----------------------------------------------------------------------
 
     fn genprime3mod4(bits: u32, seed: &[u8], idx: u32) -> BigUint {
+        use num_prime::nt_funcs::is_prime;
+
         let buflen = bits as usize / 8;
         assert!(bits % 8 == 0 && buflen > 0);
 
@@ -162,98 +158,10 @@ mod inner {
         buf[buflen - 1] |= 0x03; // set lower two bits to ensure ≡ 3 (mod 4)
 
         let mut p = mpi_import(&buf);
-        while !is_probably_prime(&p) {
+        while !is_prime(&p, None).probably() {
             p += 4u32;
         }
         p
-    }
-
-    /// Miller-Rabin primality test with 25 deterministic small-prime witnesses
-    /// followed by additional random witnesses from the OS CSPRNG.
-    fn is_probably_prime(n: &BigUint) -> bool {
-        let one = BigUint::one();
-        let two = &one + &one;
-        let three = &two + &one;
-
-        if *n < two {
-            return false;
-        }
-        if *n == two || *n == three {
-            return true;
-        }
-        if n.is_even() {
-            return false;
-        }
-
-        // Write n-1 as 2^r * d
-        let n_minus_1 = n - &one;
-        let mut d = n_minus_1.clone();
-        let mut r: u32 = 0;
-        while d.is_even() {
-            d >>= 1;
-            r += 1;
-        }
-
-        // Phase 1: Deterministic witnesses — small primes as bases.
-        // These cheaply eliminate most composites.
-        let witnesses: [u32; 25] = [
-            2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61,
-            67, 71, 73, 79, 83, 89, 97,
-        ];
-
-        for &a in &witnesses {
-            let a = BigUint::from(a);
-            if a >= *n {
-                continue;
-            }
-            if !miller_rabin_witness(&a, &d, r, n, &n_minus_1) {
-                return false;
-            }
-        }
-
-        // Phase 2: Random witnesses from OsRng for cryptographic-grade
-        // confidence.  Each random round reduces the composite-passing
-        // probability by a factor of at most 4.
-        let byte_len = n.to_bytes_be().len();
-        let n_minus_3 = &n_minus_1 - &two; // n - 3, so range + 2 gives [2, n-2]
-
-        for _ in 0..RANDOM_WITNESS_ROUNDS {
-            let mut rand_buf = vec![0u8; byte_len];
-            OsRng.fill_bytes(&mut rand_buf);
-            // Ensure the random value fits: clear the top bit to stay < n
-            rand_buf[0] &= 0x7f;
-            let a = BigUint::from_bytes_be(&rand_buf) % &n_minus_3 + &two;
-            if !miller_rabin_witness(&a, &d, r, n, &n_minus_1) {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    /// Single Miller-Rabin witness test.  Returns true if `a` is consistent
-    /// with `n` being prime ("probably prime"), false if `n` is definitely
-    /// composite.
-    fn miller_rabin_witness(
-        a: &BigUint,
-        d: &BigUint,
-        r: u32,
-        n: &BigUint,
-        n_minus_1: &BigUint,
-    ) -> bool {
-        let one = BigUint::one();
-        let two = &one + &one;
-        let mut x = a.modpow(d, n);
-        if x == one || x == *n_minus_1 {
-            return true;
-        }
-        for _ in 0..r - 1 {
-            x = x.modpow(&two, n);
-            if x == *n_minus_1 {
-                return true;
-            }
-        }
-        false
     }
 
     // -----------------------------------------------------------------------
