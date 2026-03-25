@@ -7,6 +7,10 @@ binary journal format.
 Read and write `.journal` files fully compatible with
 `journalctl --file=<path>`, without depending on `libsystemd`.
 
+> [!NOTE]
+> This package has been largely AI-generated. I intend to review it thoroughly in the future,
+> but any help reviewing or contributing is appreciated!
+
 ## Features
 
 - **Write** journal entries with arbitrary fields
