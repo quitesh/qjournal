@@ -2442,6 +2442,23 @@ impl JournalWriter {
             if *stored_hash != hash {
                 continue;
             }
+            // Type validation: ensure this is actually a Field object.
+            let type_byte = {
+                self.file.seek(SeekFrom::Start(*off))?;
+                let mut buf = [0u8; 1];
+                self.file.read_exact(&mut buf)?;
+                buf[0]
+            };
+            if type_byte != ObjectType::Field as u8 {
+                return Err(Error::CorruptObject {
+                    offset: *off,
+                    reason: format!(
+                        "expected Field object type {}, found {}",
+                        ObjectType::Field as u8,
+                        type_byte
+                    ),
+                });
+            }
             // Size comparison
             let obj_size = self.read_u64_at(off + 8)?;
             let expected_size = FIELD_OBJECT_HEADER_SIZE as u64 + field.len() as u64;
@@ -2536,12 +2553,15 @@ impl JournalWriter {
                 } else {
                     None
                 };
-                if let Some(dec) = decompressed {
-                    if dec == data {
-                        return Ok(Some(*off));
-                    }
+                let dec = decompressed.ok_or_else(|| {
+                    Error::Decompression(format!(
+                        "failed to decompress data object at offset {}",
+                        off
+                    ))
+                })?;
+                if dec == data {
+                    return Ok(Some(*off));
                 }
-                // If decompression failed or didn't match, skip this object
                 continue;
             }
 
@@ -3209,9 +3229,8 @@ impl JournalWriter {
         entry_offset: u64,
         items: &[(u64, u64)],
     ) -> Result<()> {
-        // NOTE: In systemd, there's a memory fence here (journal-file.c:2242)
-        // __atomic_thread_fence(__ATOMIC_SEQ_CST);
-        // In Rust, this is not needed for file I/O.
+        // systemd: journal-file.c:2242 __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
         // Link into global entry array
         self.link_entry_into_global_array(entry_offset)?;

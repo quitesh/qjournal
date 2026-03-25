@@ -434,6 +434,11 @@ pub fn journal_file_parse_verification_key(
         seed.push(hi * 16 + lo);
     }
 
+    // Ensure no trailing characters remain in the hex seed portion.
+    if chars.next().is_some() {
+        return Err("trailing characters after hex seed");
+    }
+
     // Parse "START_HEX-INTERVAL_HEX"
     let dash_pos = tail.find('-').ok_or("missing '-' in epoch/interval")?;
     let start = u64::from_str_radix(&tail[..dash_pos], 16)
