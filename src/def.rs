@@ -21,8 +21,9 @@ pub const DEFAULT_FIELD_HASH_TABLE_SIZE: usize = 1023;
 pub const HEADER_SIZE: u64 = 272;
 
 /// Minimum header size for reading older journal files.
-/// Corresponds to the offset of the n_data field (232 bytes).
-pub const HEADER_SIZE_MIN: u64 = 232;
+/// Matches systemd's `HEADER_SIZE_MIN = ALIGN64(offsetof(Header, n_data))`.
+/// The `n_data` field is at byte offset 208 in the packed Header struct.
+pub const HEADER_SIZE_MIN: u64 = 208;
 
 /// Objects and the header start must be 8-byte aligned.
 pub const ALIGN: u64 = 8;
@@ -44,6 +45,19 @@ pub mod compat {
     pub const SEALED: u32              = 1 << 0;
     pub const TAIL_ENTRY_BOOT_ID: u32  = 1 << 1;
     pub const SEALED_CONTINUOUS: u32   = 1 << 2;
+
+    /// Mask of all known compatible flags.
+    pub const ANY: u32 = SEALED | TAIL_ENTRY_BOOT_ID | SEALED_CONTINUOUS;
+
+    /// Mask of compatible flags we support.
+    /// SEALED and SEALED_CONTINUOUS require FSS crypto (like systemd's HAVE_GCRYPT gate).
+    pub const SUPPORTED: u32 = {
+        let mut flags = TAIL_ENTRY_BOOT_ID;
+        if cfg!(feature = "fss") {
+            flags |= SEALED | SEALED_CONTINUOUS;
+        }
+        flags
+    };
 }
 
 /// incompatible flags – readers that don't understand them MUST refuse the file.
@@ -53,11 +67,24 @@ pub mod incompat {
     pub const KEYED_HASH:      u32 = 1 << 2;
     pub const COMPRESSED_ZSTD: u32 = 1 << 3;
     pub const COMPACT:         u32 = 1 << 4;
+
+    /// Mask of all known incompatible flags.
+    pub const ANY: u32 = COMPRESSED_XZ | COMPRESSED_LZ4 | KEYED_HASH | COMPRESSED_ZSTD | COMPACT;
+
     /// Mask of flags we support when writing.
     /// We support KEYED_HASH (siphash24 keyed with file_id) and COMPACT.
     pub const SUPPORTED_WRITE: u32 = KEYED_HASH | COMPACT;
+
     /// Mask of flags we support when reading.
-    pub const SUPPORTED_READ: u32  = COMPRESSED_XZ | COMPRESSED_LZ4 | COMPRESSED_ZSTD | KEYED_HASH | COMPACT;
+    /// Compression flags are conditional on Cargo features, matching systemd's
+    /// compile-time HAVE_XZ / HAVE_LZ4 / HAVE_ZSTD gates.
+    pub const SUPPORTED_READ: u32 = {
+        let mut v = KEYED_HASH | COMPACT;
+        if cfg!(feature = "xz-compression")   { v |= COMPRESSED_XZ; }
+        if cfg!(feature = "lz4-compression")  { v |= COMPRESSED_LZ4; }
+        if cfg!(feature = "zstd-compression") { v |= COMPRESSED_ZSTD; }
+        v
+    };
 }
 
 // ── Object types ─────────────────────────────────────────────────────────
@@ -315,4 +342,27 @@ pub fn le32(v: u32) -> [u8; 4] {
 #[inline]
 pub fn from_le32(b: &[u8; 4]) -> u32 {
     u32::from_le_bytes(*b)
+}
+
+// ── Timestamp validity (matching systemd's VALID_REALTIME / VALID_MONOTONIC / VALID_EPOCH) ──
+
+/// Upper bound for plausible timestamps (2^55 usec ≈ year 3104).
+pub const VALID_UPPER: u64 = 1u64 << 55;
+
+/// Return `true` if `u` is a plausible wall-clock timestamp (non-zero, < 2^55).
+#[inline]
+pub fn valid_realtime(u: u64) -> bool {
+    u > 0 && u < VALID_UPPER
+}
+
+/// Return `true` if `u` is a plausible monotonic timestamp (< 2^55).
+#[inline]
+pub fn valid_monotonic(u: u64) -> bool {
+    u < VALID_UPPER
+}
+
+/// Return `true` if `u` is a plausible epoch timestamp (< 2^55).
+#[inline]
+pub fn valid_epoch(u: u64) -> bool {
+    u < VALID_UPPER
 }
