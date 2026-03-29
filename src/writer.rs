@@ -236,13 +236,6 @@ fn machine_id() -> [u8; 16] {
     *Uuid::new_v4().as_bytes()
 }
 
-// ── In-memory dedup indexes ──────────────────────────────────────────────
-
-/// DATA objects keyed by hash-table bucket -> [(file_offset, hash)].
-type DataIndex = HashMap<u64, Vec<(u64, u64)>>;
-/// FIELD objects keyed by hash-table bucket -> [(file_offset, hash)].
-type FieldIndex = HashMap<u64, Vec<(u64, u64)>>;
-
 /// Per-DATA entry-array tail cache: data_offset -> (tail_array_offset, items_in_tail).
 /// Avoids O(n) chain walks when appending to per-data entry arrays.
 type DataTailCache = HashMap<u64, (u64, u64)>;
@@ -301,8 +294,8 @@ pub fn minimum_header_size(obj_type: ObjectType, compact: bool) -> u64 {
 /// systemd: journal-file.c:894-932 check_object_header
 ///
 /// Validate an object header: type must be valid, size >= minimum for type,
-/// size must be 8-byte aligned (the STORED size is actual/unaligned, but
-/// the object must fit in aligned space).
+/// The stored size is the actual (unaligned) payload size; objects are
+/// padded to 8-byte alignment on disk but the size field is not aligned.
 pub fn check_object_header(obj_type: u8, obj_size: u64, offset: u64, compact: bool, expected_type: Option<ObjectType>) -> Result<()> {
     // systemd: journal-file.c:901 — size == 0 means uninitialized object
     if obj_size == 0 {
@@ -1278,9 +1271,6 @@ pub struct JournalWriter {
     // Previous boot_id for monotonic ordering checks
     prev_boot_id: [u8; 16],
 
-    // ── In-memory dedup indexes ──────────────────────────────────────
-    data_index: DataIndex,
-    field_index: FieldIndex,
     /// Per-DATA tail entry-array cache.
     data_tail_cache: DataTailCache,
 
@@ -1494,8 +1484,6 @@ impl JournalWriter {
             online: true,
             archived: false,
             prev_boot_id: [0u8; 16],
-            data_index: HashMap::new(),
-            field_index: HashMap::new(),
             data_tail_cache: HashMap::new(),
             offline_state: Arc::new(AtomicU8::new(OfflineState::Joined as u8)),
             offline_thread: None,
@@ -1537,15 +1525,6 @@ impl JournalWriter {
 
         let data_ht_n = data_ht_size / HASH_ITEM_SIZE as u64;
         let field_ht_n = field_ht_size / HASH_ITEM_SIZE as u64;
-
-        let (data_index, field_index) = rebuild_indexes(
-            &mut file,
-            offset,
-            data_ht_offset,
-            data_ht_n,
-            field_ht_offset,
-            field_ht_n,
-        )?;
 
         // Mark the file online again.
         file.seek(SeekFrom::Start(16))?;
@@ -1612,8 +1591,6 @@ impl JournalWriter {
             online: true,
             archived: false,
             prev_boot_id: h.tail_entry_boot_id,
-            data_index,
-            field_index,
             data_tail_cache: HashMap::new(),
             offline_state: Arc::new(AtomicU8::new(OfflineState::Joined as u8)),
             offline_thread: None,
@@ -2430,14 +2407,48 @@ impl JournalWriter {
         Ok(())
     }
 
-    /// Return the chain depth for a data hash bucket using the in-memory index.
-    fn count_data_chain_depth(&self, bucket: u64) -> u64 {
-        self.data_index.get(&bucket).map_or(0, |v| v.len() as u64)
+    /// Return the chain depth for a data hash bucket by walking the on-disk chain.
+    fn count_data_chain_depth(&mut self, bucket: u64) -> u64 {
+        let ht_items_start = self.data_ht_offset + OBJECT_HEADER_SIZE as u64;
+        let item_offset = ht_items_start + bucket * HASH_ITEM_SIZE as u64;
+        let mut p = match self.read_u64_at(item_offset) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let mut depth: u64 = 0;
+        while p > 0 {
+            depth += 1;
+            if depth > 1_000_000 {
+                break;
+            }
+            p = match self.read_u64_at(p + 24) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+        }
+        depth
     }
 
-    /// Return the chain depth for a field hash bucket using the in-memory index.
-    fn count_field_chain_depth(&self, bucket: u64) -> u64 {
-        self.field_index.get(&bucket).map_or(0, |v| v.len() as u64)
+    /// Return the chain depth for a field hash bucket by walking the on-disk chain.
+    fn count_field_chain_depth(&mut self, bucket: u64) -> u64 {
+        let ht_items_start = self.field_ht_offset + OBJECT_HEADER_SIZE as u64;
+        let item_offset = ht_items_start + bucket * HASH_ITEM_SIZE as u64;
+        let mut p = match self.read_u64_at(item_offset) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let mut depth: u64 = 0;
+        while p > 0 {
+            depth += 1;
+            if depth > 1_000_000 {
+                break;
+            }
+            p = match self.read_u64_at(p + 24) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+        }
+        depth
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -2446,38 +2457,59 @@ impl JournalWriter {
 
     /// systemd: journal-file.c:1520-1583 journal_file_find_field_object_with_hash
     ///
-    /// Walk the field hash chain, check hash match, then check object size match,
-    /// then memcmp payload. Returns Some(offset) if found, None otherwise.
+    /// Walk the on-disk field hash chain, check hash match, then check object
+    /// size match, then memcmp payload. Returns Some(offset) if found, None
+    /// otherwise.
     fn journal_file_find_field_object_with_hash(
         &mut self,
         field: &[u8],
         hash: u64,
     ) -> Result<Option<u64>> {
+        if self.field_ht_n == 0 {
+            return Ok(None);
+        }
+
         let bucket = hash % self.field_ht_n;
+        let ht_items_start = self.field_ht_offset + OBJECT_HEADER_SIZE as u64;
+        let item_offset = ht_items_start + bucket * HASH_ITEM_SIZE as u64;
 
-        // Use in-memory index for fast lookup
-        let chain: Vec<(u64, u64)> = self
-            .field_index
-            .get(&bucket)
-            .cloned()
-            .unwrap_or_default();
+        // Read head_hash_offset from the on-disk hash table bucket
+        let mut p = self.read_u64_at(item_offset)?;
 
-        for (off, stored_hash) in &chain {
-            if *stored_hash != hash {
+        let mut depth: u32 = 0;
+
+        while p > 0 {
+            depth += 1;
+            if depth > 1_000_000 {
+                return Err(Error::InvalidFile(
+                    "field hash chain loop detected (depth exceeded 1,000,000)".into(),
+                ));
+            }
+
+            // Read stored hash at offset +16 in FieldObject
+            let stored_hash = self.read_u64_at(p + 16)?;
+            if stored_hash != hash {
+                // Advance to next in chain via next_hash_offset at offset +24
+                p = self.read_u64_at(p + 24)?;
                 continue;
             }
+
             // Size comparison
-            let obj_size = self.read_u64_at(off + 8)?;
+            let obj_size = self.read_u64_at(p + 8)?;
             let expected_size = FIELD_OBJECT_HEADER_SIZE as u64 + field.len() as u64;
             if obj_size != expected_size {
+                p = self.read_u64_at(p + 24)?;
                 continue;
             }
+
             // Payload comparison (memcmp)
             let disk_name =
-                self.read_bytes_at(off + FIELD_OBJECT_HEADER_SIZE as u64, field.len())?;
+                self.read_bytes_at(p + FIELD_OBJECT_HEADER_SIZE as u64, field.len())?;
             if disk_name == field {
-                return Ok(Some(*off));
+                return Ok(Some(p));
             }
+
+            p = self.read_u64_at(p + 24)?;
         }
 
         Ok(None)
@@ -2485,38 +2517,54 @@ impl JournalWriter {
 
     /// systemd: journal-file.c:1621-1691 journal_file_find_data_object_with_hash
     ///
-    /// Walk the data hash chain, check hash, decompress if needed, memcmp_nn
-    /// full payload. Returns Some(offset) if found, None otherwise.
+    /// Walk the on-disk data hash chain, check hash, decompress if needed,
+    /// memcmp_nn full payload. Returns Some(offset) if found, None otherwise.
     fn journal_file_find_data_object_with_hash(
         &mut self,
         data: &[u8],
         hash: u64,
     ) -> Result<Option<u64>> {
+        if self.data_ht_n == 0 {
+            return Ok(None);
+        }
+
         let bucket = hash % self.data_ht_n;
+        let ht_items_start = self.data_ht_offset + OBJECT_HEADER_SIZE as u64;
+        let item_offset = ht_items_start + bucket * HASH_ITEM_SIZE as u64;
 
-        // Use in-memory index for fast lookup
-        let chain: Vec<(u64, u64)> = self
-            .data_index
-            .get(&bucket)
-            .cloned()
-            .unwrap_or_default();
+        // Read head_hash_offset from the on-disk hash table bucket
+        let mut p = self.read_u64_at(item_offset)?;
 
-        for (off, stored_hash) in &chain {
-            if *stored_hash != hash {
+        let mut depth: u32 = 0;
+
+        while p > 0 {
+            depth += 1;
+            if depth > 1_000_000 {
+                return Err(Error::InvalidFile(
+                    "data hash chain loop detected (depth exceeded 1,000,000)".into(),
+                ));
+            }
+
+            // Read stored hash at offset +16 in DataObject
+            let stored_hash = self.read_u64_at(p + 16)?;
+            if stored_hash != hash {
+                // Advance to next in chain via next_hash_offset at offset +24
+                p = self.read_u64_at(p + 24)?;
                 continue;
             }
+
             // Read object flags to check for compression
             let flags_byte = {
-                self.file.seek(SeekFrom::Start(off + 1))?;
+                self.file.seek(SeekFrom::Start(p + 1))?;
                 let mut buf = [0u8; 1];
                 self.file.read_exact(&mut buf)?;
                 buf[0]
             };
-            let obj_size = self.read_u64_at(off + 8)?;
+            let obj_size = self.read_u64_at(p + 8)?;
             let poffset = data_payload_offset(self.compact);
             if obj_size < poffset {
                 return Err(Error::CorruptObject {
-                    offset: *off,
+                    offset: p,
                     reason: format!(
                         "data object size {} smaller than payload offset {}",
                         obj_size, poffset
@@ -2528,7 +2576,7 @@ impl JournalWriter {
             let compressed_flags = flags_byte & obj_flags::COMPRESSED_MASK;
             if compressed_flags != 0 {
                 // systemd: journal-file.c:1645-1673 — decompress before comparing
-                let raw = self.read_bytes_at(off + poffset, payload_len as usize)?;
+                let raw = self.read_bytes_at(p + poffset, payload_len as usize)?;
                 let decompressed = if (flags_byte & obj_flags::COMPRESSED_ZSTD) != 0 {
                     #[cfg(feature = "zstd-compression")]
                     { zstd::decode_all(raw.as_slice()).ok() }
@@ -2560,23 +2608,30 @@ impl JournalWriter {
                 } else {
                     None
                 };
-                if let Some(dec) = decompressed {
-                    if dec == data {
-                        return Ok(Some(*off));
-                    }
+                let dec = decompressed.ok_or_else(|| {
+                    Error::Decompression(format!(
+                        "failed to decompress data object at offset {}",
+                        p
+                    ))
+                })?;
+                if dec == data {
+                    return Ok(Some(p));
                 }
-                // If decompression failed or didn't match, skip this object
+                p = self.read_u64_at(p + 24)?;
                 continue;
             }
 
             // Uncompressed path
             if payload_len as usize != data.len() {
+                p = self.read_u64_at(p + 24)?;
                 continue;
             }
-            let disk_payload = self.read_bytes_at(off + poffset, data.len())?;
+            let disk_payload = self.read_bytes_at(p + poffset, data.len())?;
             if disk_payload == data {
-                return Ok(Some(*off));
+                return Ok(Some(p));
             }
+
+            p = self.read_u64_at(p + 24)?;
         }
 
         Ok(None)
@@ -2639,12 +2694,6 @@ impl JournalWriter {
 
         // Link into hash table
         self.journal_file_link_field(obj_offset, bucket)?;
-
-        // Update in-memory index
-        self.field_index
-            .entry(bucket)
-            .or_default()
-            .push((obj_offset, h));
 
         Ok(obj_offset)
     }
@@ -2763,12 +2812,6 @@ impl JournalWriter {
 
         // systemd: journal-file.c:1896 journal_file_link_data(f, o, p, hash)
         self.journal_file_link_data(obj_offset, bucket)?;
-
-        // Update in-memory index
-        self.data_index
-            .entry(bucket)
-            .or_default()
-            .push((obj_offset, h));
 
         Ok((obj_offset, true))
     }
@@ -3236,9 +3279,8 @@ impl JournalWriter {
         entry_offset: u64,
         items: &[(u64, u64)],
     ) -> Result<()> {
-        // NOTE: In systemd, there's a memory fence here (journal-file.c:2242)
-        // __atomic_thread_fence(__ATOMIC_SEQ_CST);
-        // In Rust, this is not needed for file I/O.
+        // systemd: journal-file.c:2242 __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
         // Link into global entry array
         self.link_entry_into_global_array(entry_offset)?;
@@ -4240,60 +4282,6 @@ fn walk_entry_array_chain_at(file: &mut File, arr_offset: u64, compact: bool) ->
     Ok((capacity, used))
 }
 
-/// Rebuild in-memory indexes by scanning data and field hash tables.
-fn rebuild_indexes(
-    file: &mut File,
-    _file_size: u64,
-    data_ht_off: u64,
-    data_ht_n: u64,
-    field_ht_off: u64,
-    field_ht_n: u64,
-) -> Result<(DataIndex, FieldIndex)> {
-    let mut data_idx: DataIndex = HashMap::new();
-    let mut field_idx: FieldIndex = HashMap::new();
-
-    let data_items_start = data_ht_off + OBJECT_HEADER_SIZE as u64;
-    for bucket in 0..data_ht_n {
-        let item_off = data_items_start + bucket * HASH_ITEM_SIZE as u64;
-        let item = read_hash_item(file, item_off)?;
-        let mut cur = from_le64(&item.head_hash_offset);
-        while cur != 0 {
-            file.seek(SeekFrom::Start(cur + 16))?;
-            let mut buf = [0u8; 8];
-            file.read_exact(&mut buf)?;
-            let h = u64::from_le_bytes(buf);
-
-            let mut next_buf = [0u8; 8];
-            file.read_exact(&mut next_buf)?;
-            let next = u64::from_le_bytes(next_buf);
-
-            data_idx.entry(bucket).or_default().push((cur, h));
-            cur = next;
-        }
-    }
-
-    let field_items_start = field_ht_off + OBJECT_HEADER_SIZE as u64;
-    for bucket in 0..field_ht_n {
-        let item_off = field_items_start + bucket * HASH_ITEM_SIZE as u64;
-        let item = read_hash_item(file, item_off)?;
-        let mut cur = from_le64(&item.head_hash_offset);
-        while cur != 0 {
-            file.seek(SeekFrom::Start(cur + 16))?;
-            let mut buf = [0u8; 8];
-            file.read_exact(&mut buf)?;
-            let h = u64::from_le_bytes(buf);
-
-            let mut next_buf = [0u8; 8];
-            file.read_exact(&mut next_buf)?;
-            let next = u64::from_le_bytes(next_buf);
-
-            field_idx.entry(bucket).or_default().push((cur, h));
-            cur = next;
-        }
-    }
-
-    Ok((data_idx, field_idx))
-}
 
 // ══════════════════════════════════════════════════════════════════════════
 // Archive / dispose / UID parsing

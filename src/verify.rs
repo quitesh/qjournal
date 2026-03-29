@@ -112,6 +112,7 @@ fn verify_object(
     compact: bool,
     keyed_hash: bool,
     file_id: &[u8; 16],
+    seqnum_id: &[u8; 16],
 ) -> Result<()> {
     let otype = ObjectType::try_from(obj_type).map_err(|_| Error::CorruptObject {
         offset,
@@ -159,6 +160,26 @@ fn verify_object(
                     reason: format!(
                         "DATA entry_offset={:#x} but n_entries={}",
                         entry_offset, n_entries
+                    ),
+                });
+            }
+
+            // entry_array_offset consistency with n_entries
+            if n_entries > 1 && entry_array_offset == 0 {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "DATA n_entries={} > 1 but entry_array_offset is 0",
+                        n_entries
+                    ),
+                });
+            }
+            if n_entries <= 1 && entry_array_offset != 0 {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "DATA n_entries={} <= 1 but entry_array_offset={:#x} is non-zero",
+                        n_entries, entry_array_offset
                     ),
                 });
             }
@@ -298,6 +319,14 @@ fn verify_object(
                 });
             }
 
+            // Field name must not contain '='
+            if payload.contains(&b'=') {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: "FIELD payload contains '=' (invalid in field name)".into(),
+                });
+            }
+
             // Pointer alignment checks
             let next_hash_offset = read_u64_at(file, offset + 24)?;
             if next_hash_offset != 0 && !valid64(next_hash_offset) {
@@ -353,6 +382,18 @@ fn verify_object(
                 return Err(Error::CorruptObject {
                     offset,
                     reason: "ENTRY seqnum is zero".into(),
+                });
+            }
+
+            // seqnum_id null XOR seqnum zero consistency
+            let seqnum_id_is_null = *seqnum_id == [0u8; 16];
+            if seqnum_id_is_null != (seqnum == 0) {
+                return Err(Error::CorruptObject {
+                    offset,
+                    reason: format!(
+                        "ENTRY seqnum_id null ({}) inconsistent with seqnum={}",
+                        seqnum_id_is_null, seqnum
+                    ),
                 });
             }
 
@@ -577,8 +618,16 @@ fn data_object_in_hash_table(
     let bucket = stored_hash % n_buckets;
     let item_off = data_ht_offset + bucket * HASH_ITEM_SIZE as u64;
     let mut cur = read_u64_at(file, item_off)?;
+    let mut iterations: u32 = 0;
 
     while cur != 0 {
+        iterations += 1;
+        if iterations > 1_000_000 {
+            return Err(Error::CorruptObject {
+                offset: data_offset,
+                reason: "data hash chain exceeded 1,000,000 iterations (possible loop)".into(),
+            });
+        }
         if cur == data_offset {
             return Ok(true);
         }
@@ -742,13 +791,13 @@ fn verify_data_hash_table(
     data_ht_offset: u64,
     data_ht_size: u64,
     data_offsets: &HashSet<u64>,
-    entry_offsets: &HashSet<u64>,
-    compact: bool,
+    n_data: u64,
 ) -> Result<()> {
     if data_ht_offset == 0 || data_ht_size == 0 {
         return Ok(());
     }
     let n_buckets = data_ht_size / HASH_ITEM_SIZE as u64;
+    let mut total_data_count: u64 = 0;
 
     for bucket in 0..n_buckets {
         let item_off = data_ht_offset + bucket * HASH_ITEM_SIZE as u64;
@@ -790,9 +839,7 @@ fn verify_data_hash_table(
                 )));
             }
 
-            // V-01: verify this data object's entry references
-            verify_data_object(file, cur, entry_offsets, compact)?;
-
+            total_data_count += 1;
             last = cur;
             prev = cur;
             cur = read_u64_at(file, cur + 24)?;
@@ -812,6 +859,13 @@ fn verify_data_hash_table(
                 bucket, last, tail
             )));
         }
+    }
+
+    if total_data_count != n_data {
+        return Err(Error::InvalidFile(format!(
+            "data hash table contains {} data objects but expected {}",
+            total_data_count, n_data
+        )));
     }
 
     Ok(())
@@ -901,7 +955,30 @@ fn verify_entry_array(
     let mut prev_entry_off = 0u64;
 
     while cur_array != 0 {
+        // Verify type byte is EntryArray
+        let type_byte = {
+            file.seek(SeekFrom::Start(cur_array))?;
+            let mut buf = [0u8; 1];
+            file.read_exact(&mut buf)?;
+            buf[0]
+        };
+        if type_byte != ObjectType::EntryArray as u8 {
+            return Err(Error::InvalidFile(format!(
+                "entry array chain at {:#x} has type {} instead of EntryArray",
+                cur_array, type_byte
+            )));
+        }
+
         let ea_size = read_u64_at(file, cur_array + 8)?;
+
+        // Minimum size check
+        if ea_size < ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 {
+            return Err(Error::InvalidFile(format!(
+                "entry array at {:#x} size {} < minimum {}",
+                cur_array, ea_size, ENTRY_ARRAY_OBJECT_HEADER_SIZE
+            )));
+        }
+
         let n_items = entry_array_n_items(ea_size, compact);
 
         for i in 0..n_items {
@@ -1328,6 +1405,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
             compact,
             keyed_hash,
             &header.file_id,
+            &header.seqnum_id,
         )?;
 
         // Advance to next object
@@ -1463,15 +1541,8 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
 
     // -- Second pass: cross-reference verification ------------------------
 
-    // 1. Verify data hash table chains (also validates per-data entry references: V-01)
-    verify_data_hash_table(
-        &mut file,
-        data_ht_offset,
-        data_ht_size,
-        &data_offsets,
-        &entry_offsets,
-        compact,
-    )?;
+    // 1. Verify data hash table chains
+    verify_data_hash_table(&mut file, data_ht_offset, data_ht_size, &data_offsets, n_data)?;
 
     // 2. Verify each entry's data items exist and are reachable from hash table
     //    V-02: Also verify reverse links (data->entry) with last-entry exemption

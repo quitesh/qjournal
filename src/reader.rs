@@ -65,7 +65,7 @@ pub enum LocationType {
 // ── Chain cache ──────────────────────────────────────────────────────────
 // systemd: journal-file.c:2662-2710
 
-const CHAIN_CACHE_MAX: usize = 20;
+const CHAIN_CACHE_MAX: usize = 1024;
 
 /// systemd: journal-file.c:2662-2669 ChainCacheItem
 #[derive(Debug, Clone)]
@@ -131,7 +131,9 @@ pub struct JournalReader {
     data_ht_items: u64,
     data_ht_n: u64,
     /// Byte offset of the field hash table items (past ObjectHeader).
+    #[allow(dead_code)]
     field_ht_items: u64,
+    #[allow(dead_code)]
     field_ht_n: u64,
     /// Offset of the root entry-array object, or 0.
     entry_array_offset: u64,
@@ -405,21 +407,20 @@ impl JournalReader {
         let mut p = self.read_u64_at(item_off)?;
 
         // systemd: get_next_hash_offset tracks depth and detects loops
-        #[allow(unused_assignments)]
-        let mut prev = 0u64;
+        let mut depth: u32 = 0;
 
         while p > 0 {
+            depth += 1;
+            if depth > 1_000_000 {
+                return Err(Error::InvalidFile("hash chain loop detected (depth exceeded 1,000,000)".into()));
+            }
+
             let (_, _obj_size) = self.move_to_object(ObjectType::Data, p)?;
 
             let stored_hash = self.read_u64_at(p + 16)?; // data.hash
             if stored_hash != hash {
-                // Advance to next in chain with loop detection
-                prev = p;
+                // Advance to next in chain
                 p = self.read_u64_at(p + 24)?; // data.next_hash_offset
-                // systemd: journal-file.c:1505 — loop detection
-                if p > 0 && p <= prev {
-                    return Err(Error::InvalidFile("hash chain loop detected".into()));
-                }
                 continue;
             }
 
@@ -429,11 +430,7 @@ impl JournalReader {
                 return Ok(Some(p));
             }
 
-            prev = p;
             p = self.read_u64_at(p + 24)?;
-            if p > 0 && p <= prev {
-                return Err(Error::InvalidFile("hash chain loop detected".into()));
-            }
         }
 
         Ok(None)
@@ -531,8 +528,12 @@ impl JournalReader {
         if compressed & obj_flags::COMPRESSED_ZSTD != 0 {
             #[cfg(feature = "zstd-compression")]
             {
-                return zstd::decode_all(raw.as_slice())
-                    .map_err(|e| Error::Decompression(e.to_string()));
+                let decompressed = zstd::decode_all(raw.as_slice())
+                    .map_err(|e| Error::Decompression(e.to_string()))?;
+                if decompressed.len() as u64 > 4 * 1024 * 1024 * 1024 {
+                    return Err(Error::Decompression("ZSTD decompressed size exceeds 4GiB limit".into()));
+                }
+                return Ok(decompressed);
             }
             #[cfg(not(feature = "zstd-compression"))]
             {
@@ -549,6 +550,9 @@ impl JournalReader {
                 decoder
                     .read_to_end(&mut decompressed)
                     .map_err(|e| Error::Decompression(e.to_string()))?;
+                if decompressed.len() as u64 > 4 * 1024 * 1024 * 1024 {
+                    return Err(Error::Decompression("XZ decompressed size exceeds 4GiB limit".into()));
+                }
                 return Ok(decompressed);
             }
             #[cfg(not(feature = "xz-compression"))]
@@ -565,8 +569,12 @@ impl JournalReader {
                 if raw.len() < 8 {
                     return Err(Error::Decompression("LZ4 data too short".into()));
                 }
-                let uncompressed_size =
-                    u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
+                let uncompressed_size_u64 =
+                    u64::from_le_bytes(raw[..8].try_into().unwrap());
+                if uncompressed_size_u64 > 4 * 1024 * 1024 * 1024 {
+                    return Err(Error::Decompression("LZ4 uncompressed size exceeds 4GiB limit".into()));
+                }
+                let uncompressed_size = uncompressed_size_u64 as usize;
                 let compressed_data = &raw[8..];
                 let decompressed =
                     lz4_flex::decompress(compressed_data, uncompressed_size)
@@ -632,11 +640,8 @@ impl JournalReader {
             if data_off == 0 {
                 continue;
             }
-            match self.read_data_payload(data_off) {
-                Ok(field) => fields.push(field),
-                Err(ref e) if Self::is_corruption_error(e) => continue, // skip corrupt
-                Err(e) => return Err(e), // propagate I/O errors
-            }
+            let field = self.read_data_payload(data_off)?;
+            fields.push(field);
         }
 
         Ok(JournalEntry {
@@ -662,7 +667,7 @@ impl JournalReader {
         last_index: u64,
     ) {
         // Don't cache if array == first (first array in chain, not worth caching)
-        if !self.chain_cache.contains_key(&first) && array == first {
+        if array == first {
             return;
         }
 
@@ -783,7 +788,7 @@ impl JournalReader {
 
         // Try chain cache
         if let Some(ci) = self.chain_cache.get(&first).cloned() {
-            if i > ci.total {
+            if i >= ci.total {
                 a = ci.array;
                 i -= ci.total;
                 t = ci.total;
@@ -882,10 +887,7 @@ impl JournalReader {
     /// systemd: journal-file.c:3321-3333 test_object_offset
     fn test_object_offset(&self, p: u64, needle: u64) -> Result<i32> {
         if p == 0 {
-            return Err(Error::CorruptObject {
-                offset: 0,
-                reason: "null offset in test_object_offset".into(),
-            });
+            return Ok(TEST_GOTO_PREVIOUS);
         }
         if p == needle {
             Ok(TEST_FOUND)
@@ -1067,7 +1069,7 @@ impl JournalReader {
             let (_, obj_size) = self.move_to_object(ObjectType::EntryArray, a)?;
             let k = entry_array_n_items(obj_size, self.compact);
             let mut m = k.min(n);
-            let m_original = m;
+            let _m_original = m;
             if m == 0 {
                 return Ok(None);
             }
@@ -1131,16 +1133,11 @@ impl JournalReader {
                 // Main bisection loop
                 loop {
                     if left == right {
-                        if m != m_original && direction == Direction::Down {
-                            let r = self.generic_array_bisect_step(
-                                a, left, needle, test_fn, direction, &mut m, &mut left, &mut right,
-                            )?;
-                            if r == TEST_GOTO_PREVIOUS || r == TEST_GOTO_NEXT {
-                                return Ok(None);
-                            }
-                            // systemd: journal-file.c:3139-3140
-                            debug_assert!(r == TEST_RIGHT);
-                            debug_assert!(left == right);
+                        let r = self.generic_array_bisect_step(
+                            a, left, needle, test_fn, direction, &mut m, &mut left, &mut right,
+                        )?;
+                        if r == TEST_GOTO_PREVIOUS || r == TEST_GOTO_NEXT {
+                            return Ok(None);
                         }
                         // Found
                         return self.bisect_found(a, first, left, t);
@@ -1279,6 +1276,11 @@ impl JournalReader {
         let extra = self.read_u64_at(data_offset + 40)?; // entry_offset (inline)
         let first = self.read_u64_at(data_offset + 48)?; // entry_array_offset
 
+        // Guard: if inline entry offset is zero, skip testing it
+        if extra == 0 {
+            return Ok(None);
+        }
+
         // Test the extra (inline) entry
         let r = test_fn(self, extra, needle)?;
 
@@ -1301,7 +1303,7 @@ impl JournalReader {
         }
 
         // Nothing found in chain; for UP, use the extra
-        if direction == Direction::Up {
+        if direction == Direction::Up && extra != 0 {
             let _ = self.move_to_object(ObjectType::Entry, extra)?;
             return Ok(Some(extra));
         }
