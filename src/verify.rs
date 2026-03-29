@@ -838,12 +838,11 @@ fn verify_data_hash_table(
         }
     }
 
-    if total_data_count != n_data {
-        return Err(Error::InvalidFile(format!(
-            "data hash table contains {} data objects but expected {}",
-            total_data_count, n_data
-        )));
-    }
+    // Note: systemd does NOT check that all DATA objects from pass 1 appear in the hash
+    // chains. Orphaned DATA objects (appended but not yet linked due to partial write)
+    // are tolerated by systemd. The pass-1 n_data count is validated against the header
+    // separately. We only verify that what the hash table points to is consistent.
+    let _ = total_data_count;
 
     Ok(())
 }
