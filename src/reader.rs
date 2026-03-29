@@ -1210,8 +1210,9 @@ impl JournalReader {
             });
         }
 
-        // Validate it's an entry
-        let _ = self.move_to_object(ObjectType::Entry, p)?;
+        // systemd: journal-file.c:3221-3225 — only validates when ret_object != NULL.
+        // In next_entry, ret_object is NULL, so no validation here. The caller uses
+        // generic_array_get which handles corrupt entries gracefully by skipping them.
 
         Ok(Some((p, t + i)))
     }

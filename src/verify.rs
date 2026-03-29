@@ -499,9 +499,11 @@ fn verify_object(
                 });
             }
 
-            // Per-item VALID64 and monotonicity check
+            // Per-item VALID64 check only.
+            // systemd: journal-verify.c:342-360 — only checks VALID64, no monotonicity.
+            // Monotonicity is checked in the second-pass verify_data / verify_entry_array
+            // for referenced arrays only. Orphaned entry arrays are not checked at all.
             let n_items = entry_array_n_items(obj_size, compact);
-            let mut prev_off = 0u64;
             for i in 0..n_items {
                 let item_off =
                     offset + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + i * ea_item_sz;
@@ -524,17 +526,6 @@ fn verify_object(
                         ),
                     });
                 }
-
-                if entry_off <= prev_off && prev_off != 0 {
-                    return Err(Error::CorruptObject {
-                        offset,
-                        reason: format!(
-                            "ENTRY_ARRAY item {} offset {:#x} <= previous {:#x}",
-                            i, entry_off, prev_off
-                        ),
-                    });
-                }
-                prev_off = entry_off;
             }
         }
         ObjectType::Tag => {
@@ -652,13 +643,14 @@ fn data_object_entry_chain_contains(
 /// systemd: journal-verify.c:425-525 verify_data
 ///
 /// For each data object, verify:
-/// - Each entry in its chain exists in `entry_offsets`
+/// - Each entry in its chain is in the main entry array (not just any ENTRY object)
+///   systemd: contains_uint64 + journal_file_move_to_entry_by_offset checks
 /// - entry_array_offset != 0 implies n_entries >= 2 (V-06)
 /// - Monotonic ordering of entries in per-data chain (V-06)
 fn verify_data_object(
     file: &mut File,
     data_off: u64,
-    entry_offsets: &HashSet<u64>,
+    main_entry_set: &HashSet<u64>,
     compact: bool,
 ) -> Result<()> {
     let entry_offset = read_u64_at(file, data_off + 40)?;
@@ -682,9 +674,9 @@ fn verify_data_object(
 
     // First entry is the inline one (entry_offset)
     if entry_offset != 0 {
-        if !entry_offsets.contains(&entry_offset) {
+        if !main_entry_set.contains(&entry_offset) {
             return Err(Error::InvalidFile(format!(
-                "DATA at {:#x} inline entry_offset {:#x} is not a known ENTRY",
+                "DATA at {:#x} inline entry_offset {:#x} is not in the main entry array",
                 data_off, entry_offset
             )));
         }
@@ -720,9 +712,9 @@ fn verify_data_object(
             }
             last_entry = entry_off;
 
-            if !entry_offsets.contains(&entry_off) {
+            if !main_entry_set.contains(&entry_off) {
                 return Err(Error::InvalidFile(format!(
-                    "DATA at {:#x} entry array references {:#x} which is not a known ENTRY",
+                    "DATA at {:#x} entry array references {:#x} which is not in the main entry array",
                     data_off, entry_off
                 )));
             }
@@ -767,7 +759,7 @@ fn verify_data_hash_table(
     data_ht_size: u64,
     data_offsets: &HashSet<u64>,
     n_data: u64,
-    entry_offsets: &HashSet<u64>,
+    main_entry_set: &HashSet<u64>,
     compact: bool,
 ) -> Result<()> {
     if data_ht_offset == 0 || data_ht_size == 0 {
@@ -817,7 +809,7 @@ fn verify_data_hash_table(
             }
 
             // V-01: verify this data object's entry references
-            verify_data_object(file, cur, entry_offsets, compact)?;
+            verify_data_object(file, cur, main_entry_set, compact)?;
 
             total_data_count += 1;
             last = cur;
@@ -1257,6 +1249,14 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                 n_fields += 1;
             }
             ObjectType::Entry => {
+                // systemd: journal-verify.c:1259 — entries before first tag in sealed journals
+                if (compat & compat::SEALED) != 0 && n_tags == 0 {
+                    return Err(Error::InvalidFile(format!(
+                        "ENTRY at {:#x} appears before first TAG in sealed journal",
+                        p
+                    )));
+                }
+
                 let seqnum = read_u64_at(&mut file, p + 16)?;
                 let realtime = read_u64_at(&mut file, p + 24)?;
                 let monotonic = read_u64_at(&mut file, p + 32)?;
@@ -1583,25 +1583,12 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
 
     // -- Second pass: cross-reference verification ------------------------
 
-    // 1. Verify data hash table chains (also validates per-data entry references: V-01)
-    verify_data_hash_table(
-        &mut file,
-        data_ht_offset,
-        data_ht_size,
-        &data_offsets,
-        n_data,
-        &entry_offsets,
-        compact,
-    )?;
-
-    // 2. Verify each entry's data items exist and are reachable from hash table
-    //    V-02: Also verify reverse links (data->entry) with last-entry exemption
-    //
     // Build the set of entries in the main entry array chain, bounded by n_entries.
-    // Only entries in this set get verify_entry called on them.
-    // systemd: verify_entry is only called from verify_entry_array, which only
-    // processes entries referenced by the main array (journal-verify.c:693-772).
-    // Also determines the last entry for the is_last exemption.
+    // - Used by verify_data_object to check that data-linked entries are in the main array
+    //   (systemd: journal_file_move_to_entry_by_offset check in verify_data)
+    // - Used to restrict verify_entry calls to main-array entries only
+    //   (systemd: verify_entry is only called from verify_entry_array)
+    // - Determines the last entry for the is_last exemption
     let mut main_entry_set: HashSet<u64> = HashSet::new();
     let last_array_entry: u64 = {
         let mut last = 0u64;
@@ -1630,6 +1617,20 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         }
         last
     };
+
+    // 1. Verify data hash table chains (also validates per-data entry references: V-01)
+    verify_data_hash_table(
+        &mut file,
+        data_ht_offset,
+        data_ht_size,
+        &data_offsets,
+        n_data,
+        &main_entry_set,
+        compact,
+    )?;
+
+    // 2. Verify each entry's data items exist and are reachable from hash table
+    //    V-02: Also verify reverse links (data->entry) with last-entry exemption
 
     let mut p2 = header_size;
     if tail_object_offset > 0 {
