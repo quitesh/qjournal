@@ -112,7 +112,7 @@ fn verify_object(
     compact: bool,
     keyed_hash: bool,
     file_id: &[u8; 16],
-    seqnum_id: &[u8; 16],
+    _seqnum_id: &[u8; 16],
 ) -> Result<()> {
     let otype = ObjectType::try_from(obj_type).map_err(|_| Error::CorruptObject {
         offset,
@@ -382,18 +382,6 @@ fn verify_object(
                 return Err(Error::CorruptObject {
                     offset,
                     reason: "ENTRY seqnum is zero".into(),
-                });
-            }
-
-            // seqnum_id null XOR seqnum zero consistency
-            let seqnum_id_is_null = *seqnum_id == [0u8; 16];
-            if seqnum_id_is_null != (seqnum == 0) {
-                return Err(Error::CorruptObject {
-                    offset,
-                    reason: format!(
-                        "ENTRY seqnum_id null ({}) inconsistent with seqnum={}",
-                        seqnum_id_is_null, seqnum
-                    ),
                 });
             }
 
@@ -792,6 +780,8 @@ fn verify_data_hash_table(
     data_ht_size: u64,
     data_offsets: &HashSet<u64>,
     n_data: u64,
+    entry_offsets: &HashSet<u64>,
+    compact: bool,
 ) -> Result<()> {
     if data_ht_offset == 0 || data_ht_size == 0 {
         return Ok(());
@@ -838,6 +828,9 @@ fn verify_data_hash_table(
                     bucket
                 )));
             }
+
+            // V-01: verify this data object's entry references
+            verify_data_object(file, cur, entry_offsets, compact)?;
 
             total_data_count += 1;
             last = cur;
@@ -1541,13 +1534,45 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
 
     // -- Second pass: cross-reference verification ------------------------
 
-    // 1. Verify data hash table chains
-    verify_data_hash_table(&mut file, data_ht_offset, data_ht_size, &data_offsets, n_data)?;
+    // 1. Verify data hash table chains (also validates per-data entry references: V-01)
+    verify_data_hash_table(
+        &mut file,
+        data_ht_offset,
+        data_ht_size,
+        &data_offsets,
+        n_data,
+        &entry_offsets,
+        compact,
+    )?;
 
     // 2. Verify each entry's data items exist and are reachable from hash table
     //    V-02: Also verify reverse links (data->entry) with last-entry exemption
+    //
+    // Determine the last entry in the main array chain (systemd: last entry by position
+    // in the main entry array, not by file offset order).
+    let last_array_entry: u64 = {
+        let mut last = 0u64;
+        let mut cur = entry_array_off;
+        while cur != 0 {
+            let ea_size = read_u64_at(&mut file, cur + 8).unwrap_or(0);
+            let n = entry_array_n_items(ea_size, compact);
+            for i in 0..n {
+                let off = read_entry_array_item(&mut file, cur, i, compact).unwrap_or(0);
+                if off == 0 {
+                    break;
+                }
+                last = off;
+            }
+            let next = read_u64_at(&mut file, cur + 16).unwrap_or(0);
+            if next == 0 || next <= cur {
+                break;
+            }
+            cur = next;
+        }
+        last
+    };
+
     let mut p2 = header_size;
-    let mut entry_index: u64 = 0;
     if tail_object_offset > 0 {
         loop {
             let obj_type_byte2 = {
@@ -1559,8 +1584,9 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
             let obj_size2 = read_u64_at(&mut file, p2 + 8)?;
 
             if obj_type_byte2 == ObjectType::Entry as u8 {
-                entry_index += 1;
-                let is_last = entry_index == n_entries;
+                // is_last: matches the last entry in the main array chain
+                // (systemd: journal-verify.c:759 `last = i + 1 == n`)
+                let is_last = last_array_entry != 0 && p2 == last_array_entry;
                 verify_entry(
                     &mut file,
                     p2,

@@ -1069,7 +1069,7 @@ impl JournalReader {
             let (_, obj_size) = self.move_to_object(ObjectType::EntryArray, a)?;
             let k = entry_array_n_items(obj_size, self.compact);
             let mut m = k.min(n);
-            let _m_original = m;
+            let m_original = m;
             if m == 0 {
                 return Ok(None);
             }
@@ -1133,11 +1133,17 @@ impl JournalReader {
                 // Main bisection loop
                 loop {
                     if left == right {
-                        let r = self.generic_array_bisect_step(
-                            a, left, needle, test_fn, direction, &mut m, &mut left, &mut right,
-                        )?;
-                        if r == TEST_GOTO_PREVIOUS || r == TEST_GOTO_NEXT {
-                            return Ok(None);
+                        // systemd: journal-file.c:3121-3144 — only re-test on truncation+DOWN
+                        if m != m_original && direction == Direction::Down {
+                            let r = self.generic_array_bisect_step(
+                                a, left, needle, test_fn, direction, &mut m, &mut left, &mut right,
+                            )?;
+                            if r == TEST_GOTO_PREVIOUS || r == TEST_GOTO_NEXT {
+                                return Ok(None);
+                            }
+                            // systemd: journal-file.c:3139-3140
+                            debug_assert!(r == TEST_RIGHT);
+                            debug_assert!(left == right);
                         }
                         // Found
                         return self.bisect_found(a, first, left, t);
@@ -1276,9 +1282,13 @@ impl JournalReader {
         let extra = self.read_u64_at(data_offset + 40)?; // entry_offset (inline)
         let first = self.read_u64_at(data_offset + 48)?; // entry_array_offset
 
-        // Guard: if inline entry offset is zero, skip testing it
+        // systemd: journal-file.c:3264 calls test_object(f, extra, needle) unconditionally;
+        // extra == 0 with n_entries >= 1 is file corruption, propagate as error.
         if extra == 0 {
-            return Ok(None);
+            return Err(Error::CorruptObject {
+                offset: data_offset,
+                reason: "DATA entry_offset is zero but n_entries >= 1".into(),
+            });
         }
 
         // Test the extra (inline) entry
