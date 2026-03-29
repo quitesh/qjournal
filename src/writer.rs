@@ -141,6 +141,14 @@ type PostChangeCallback = Box<dyn FnMut() + Send>;
 /// systemd: journal-file.c:4666
 const HASH_CHAIN_DEPTH_MAX: u64 = 100;
 
+/// Default compression threshold in bytes.
+/// systemd: journal-file.c:51 DEFAULT_COMPRESS_THRESHOLD
+const DEFAULT_COMPRESS_THRESHOLD: u64 = 512;
+
+/// Minimum compression threshold in bytes.
+/// systemd: journal-file.c:52 MIN_COMPRESS_THRESHOLD
+const MIN_COMPRESS_THRESHOLD: u64 = 8;
+
 /// Minimum journal file size (512 KB).
 /// systemd: journal-file.c
 const JOURNAL_FILE_SIZE_MIN: u64 = 512 * 1024;
@@ -699,12 +707,12 @@ pub fn verify_header(
 
     // systemd: journal-file.c:588
     // If SEALED compat flag is set, the header must be large enough to contain
-    // the n_entry_arrays field (offset 256, so header_size must be >= 264).
+    // the n_entry_arrays field (offset 232, so header_size must be >= 240).
     {
         let compat = from_le32(&header.compatible_flags);
         if (compat & compat::SEALED) != 0 {
-            // n_entry_arrays is at byte offset 256 in the header struct, size 8.
-            const N_ENTRY_ARRAYS_END: u64 = 264;
+            // n_entry_arrays is at byte offset 232 in the header struct, size 8.
+            const N_ENTRY_ARRAYS_END: u64 = 240;
             if header_size < N_ENTRY_ARRAYS_END {
                 return Err(Error::InvalidFile(
                     "SEALED flag set but header too small for n_entry_arrays field".into(),
@@ -881,17 +889,17 @@ pub fn verify_header(
         ));
     }
     // systemd: journal-file.c:631 — tail_entry_array_n_entries must not exceed the space
-    // available in the entry array object at tail_entry_array_offset.
+    // available from tail_entry_array_offset to end of file.
+    // systemd check: n * item_size > header_size + arena_size - tail_entry_array_offset
+    // (uses raw region size, not subtracting the entry array object header)
     if tail_entry_array_offset != 0 && tail_entry_array_n_entries > 0 {
         let compact = (incompat & incompat::COMPACT) != 0;
         let item_sz = entry_array_item_size(compact);
-        // Maximum object size: from tail_entry_array_offset to end of arena (total).
         let max_obj_size = total.saturating_sub(tail_entry_array_offset);
-        let max_items = entry_array_n_items(max_obj_size, compact);
-        if tail_entry_array_n_entries > max_items {
+        if tail_entry_array_n_entries.saturating_mul(item_sz) > max_obj_size {
             return Err(Error::InvalidFile(format!(
-                "tail_entry_array_n_entries ({}) exceeds available space ({} items, item_sz={})",
-                tail_entry_array_n_entries, max_items, item_sz
+                "tail_entry_array_n_entries ({}) * item_sz ({}) > region_size ({})",
+                tail_entry_array_n_entries, item_sz, max_obj_size
             )));
         }
     }
@@ -1226,6 +1234,9 @@ pub struct JournalWriter {
     strict_order: bool,
     /// Compression codec to use when writing new DATA objects.
     compression: Compression,
+    /// Minimum payload size (bytes) before compression is attempted.
+    /// systemd: journal-file.c compress_threshold_bytes (default 512, min 8).
+    compress_threshold_bytes: u64,
 
     // ── Header statistics ────────────────────────────────────────────
     n_objects: u64,
@@ -1336,11 +1347,21 @@ impl JournalWriter {
     // systemd: journal-file.c journal_file_init_header() + journal_file_setup_data_hash_table()
     //          + journal_file_setup_field_hash_table().
 
+    /// systemd: parse_boolean() — accept "1"/"yes"/"true"/"on" as true,
+    /// "0"/"no"/"false"/"off" as false.
+    fn parse_boolean(s: &str) -> Option<bool> {
+        match s.to_lowercase().as_str() {
+            "1" | "yes" | "true" | "on" => Some(true),
+            "0" | "no" | "false" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
     /// Check if keyed hash is requested via SYSTEMD_JOURNAL_KEYED_HASH env var.
     /// Defaults to true if not set.
     fn keyed_hash_requested() -> bool {
         match std::env::var("SYSTEMD_JOURNAL_KEYED_HASH") {
-            Ok(v) => v != "0" && v.to_lowercase() != "false",
+            Ok(v) => Self::parse_boolean(&v).unwrap_or(true),
             Err(_) => true,
         }
     }
@@ -1349,8 +1370,8 @@ impl JournalWriter {
     /// Defaults to true if not set.
     fn compact_mode_requested() -> bool {
         match std::env::var("SYSTEMD_JOURNAL_COMPACT") {
-            Ok(v) => v != "0" && v.to_lowercase() != "false",
-            Err(_) => false, // default: disabled for wider compatibility
+            Ok(v) => Self::parse_boolean(&v).unwrap_or(true),
+            Err(_) => true, // default: enabled, matching systemd
         }
     }
 
@@ -1448,6 +1469,7 @@ impl JournalWriter {
             compact,
             strict_order: true,
             compression: compression_requested(),
+            compress_threshold_bytes: DEFAULT_COMPRESS_THRESHOLD,
             n_objects: 2, // data + field hash tables
             n_entries: 0,
             n_data: 0,
@@ -1574,6 +1596,7 @@ impl JournalWriter {
                 ..JournalMetrics::default()
             },
             compression: compression_requested(),
+            compress_threshold_bytes: DEFAULT_COMPRESS_THRESHOLD,
             path: None,
             online: true,
             archived: false,
@@ -1636,15 +1659,8 @@ impl JournalWriter {
             )));
         }
 
-        // systemd: journal-file.c:2546-2558
-        // Validate timestamps: realtime must be >= previous, monotonic >= previous if same boot
-        if self.tail_entry_realtime != 0 && realtime < self.tail_entry_realtime {
-            // Allow it but don't enforce strict ordering for now
-            // (system clock can go backwards)
-        }
-
-        // systemd: journal-file.c journal_file_entry_seqnum() (lines 1204-1228)
-        let seqnum_val = self.journal_file_entry_seqnum(seqnum);
+        // Note: strict_order check (realtime/monotonic) is done inside
+        // journal_file_append_entry_internal, matching systemd's placement.
 
         // systemd: journal-file.c:2600-2626
         //   for (size_t i = 0; i < n_iovec; i++) {
@@ -1701,6 +1717,10 @@ impl JournalWriter {
         //   n_iovec = remove_duplicate_entry_items(items, n_iovec);
         items.sort_by(entry_item_cmp);
         remove_duplicate_entry_items(&mut items);
+
+        // systemd: journal_file_entry_seqnum() is called AFTER data objects are
+        // appended, just before the entry object write (journal-file.c:2633).
+        let seqnum_val = self.journal_file_entry_seqnum(seqnum);
 
         // systemd: journal-file.c:2307-2412 (journal_file_append_entry_internal)
         let entry_offset =
@@ -1763,8 +1783,6 @@ impl JournalWriter {
             return Err(Error::InvalidFile("empty boot ID".into()));
         }
 
-        let seqnum_val = self.journal_file_entry_seqnum(seqnum);
-
         let mut items: Vec<(u64, u64)> = Vec::with_capacity(fields.len());
         let mut xor_hash: u64 = 0;
 
@@ -1802,6 +1820,10 @@ impl JournalWriter {
         items.sort_by(entry_item_cmp);
         remove_duplicate_entry_items(&mut items);
 
+        // systemd: journal_file_entry_seqnum() is called AFTER data objects are
+        // appended, just before the entry object write (journal-file.c:2633).
+        let seqnum_val = self.journal_file_entry_seqnum(seqnum);
+
         let entry_offset =
             self.journal_file_append_entry_internal(seqnum_val, realtime, monotonic, boot_id, xor_hash, &items)?;
 
@@ -1836,6 +1858,13 @@ impl JournalWriter {
     /// Return the current path of this journal file, if known.
     pub fn path(&self) -> Option<&str> {
         self.path.as_deref()
+    }
+
+    /// Set the compression threshold in bytes.
+    /// Payloads smaller than this are stored uncompressed.
+    /// systemd: journal-file.c:4131-4133 — clamped to MIN_COMPRESS_THRESHOLD (8).
+    pub fn set_compress_threshold_bytes(&mut self, bytes: u64) {
+        self.compress_threshold_bytes = std::cmp::max(MIN_COMPRESS_THRESHOLD, bytes);
     }
 
     /// Return a reference to the current metrics.
@@ -1879,12 +1908,10 @@ impl JournalWriter {
 
         // systemd: journal-file.c:4375-4380
         // Format: foo@SEQNUM_ID-HEAD_SEQNUM-HEAD_REALTIME.journal
+        // systemd uses SD_ID128_FORMAT_STR which is 32 lowercase hex chars,
+        // NO dashes (e.g., "0123456789abcdef0123456789abcdef").
         let base = &old_path[..old_path.len() - 8]; // strip ".journal"
-        let seqnum_id_hex = self
-            .seqnum_id
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>();
+        let seqnum_id_hex: String = self.seqnum_id.iter().map(|b| format!("{:02x}", b)).collect();
         let new_path = format!(
             "{}@{}-{:016x}-{:016x}.journal",
             base, seqnum_id_hex, self.head_entry_seqnum, self.head_entry_realtime
@@ -2079,19 +2106,26 @@ impl JournalWriter {
             new_size = self.metrics.max_size;
         }
 
-        // Pre-allocate
+        // Pre-allocate with EINTR retry loop (matching systemd's posix_fallocate_loop).
         #[cfg(target_os = "linux")]
         {
             let fd = {
                 use std::os::unix::io::AsRawFd;
                 self.file.as_raw_fd()
             };
-            let r = unsafe {
-                libc::posix_fallocate(fd, old_size as libc::off_t, (new_size - old_size) as libc::off_t)
-            };
+            let mut r;
+            loop {
+                r = unsafe {
+                    libc::posix_fallocate(fd, old_size as libc::off_t, (new_size - old_size) as libc::off_t)
+                };
+                if r != libc::EINTR {
+                    break;
+                }
+            }
             if r != 0 {
-                // Fall back to set_len on failure
-                self.file.set_len(new_size)?;
+                // Do NOT fall back to set_len — that creates a sparse file.
+                // systemd explicitly assumes journal files are not sparse.
+                return Err(Error::Io(std::io::Error::from_raw_os_error(r)));
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -2743,8 +2777,8 @@ impl JournalWriter {
             self.file.write_all(&[0u8; 8])?;
         }
 
-        // systemd: journal-file.c:1884-1894 — attempt compression for payloads > 512 bytes
-        let (final_payload, compress_flag, incompat_flag) = if payload.len() >= 512 {
+        // systemd: journal-file.c:1884-1894 — attempt compression for payloads >= compress_threshold_bytes
+        let (final_payload, compress_flag, incompat_flag) = if payload.len() as u64 >= self.compress_threshold_bytes {
             self.try_compress_payload(payload)
         } else {
             (payload.to_vec(), 0u8, 0u32)
@@ -2753,10 +2787,10 @@ impl JournalWriter {
         self.file.write_all(&final_payload)?;
 
         // If compressed, update object size and flags on disk.
-        // Note: we still advance self.offset by the originally allocated total_size
-        // (based on uncompressed payload), matching systemd's behaviour where
-        // journal_file_append_object allocates before compression happens.
-        if compress_flag != 0 {
+        // systemd: after compression, tail_end = tail_object_offset + ALIGN64(compressed_size),
+        // so the next object is placed at compressed_size boundary, not uncompressed_size.
+        // We must advance self.offset by the compressed allocation, not the original.
+        let effective_actual_size = if compress_flag != 0 {
             let new_actual_size =
                 data_payload_offset(self.compact) + final_payload.len() as u64;
             // Update size field: ObjectHeader.size at offset obj_offset + 8
@@ -2767,17 +2801,21 @@ impl JournalWriter {
             self.file.write_all(&[compress_flag])?;
             // Set the incompatible flag in the header
             self.set_incompatible_flag(incompat_flag)?;
-        }
+            new_actual_size
+        } else {
+            actual_size
+        };
 
+        let effective_total_size = align64(effective_actual_size);
         let written = data_payload_offset(self.compact) + final_payload.len() as u64;
-        if total_size > written {
+        if effective_total_size > written {
             // Seek to end of actual written data before padding
             // (compression seek-backs may have moved the cursor)
             self.file.seek(SeekFrom::Start(obj_offset + written))?;
-            write_zeros(&mut self.file, total_size - written)?;
+            write_zeros(&mut self.file, effective_total_size - written)?;
         }
 
-        self.offset = obj_offset + total_size;
+        self.offset = obj_offset + effective_total_size;
         self.tail_object_offset = obj_offset;
         self.n_objects += 1;
         // n_data is incremented in journal_file_link_data (matching C:1483)
@@ -3161,7 +3199,6 @@ impl JournalWriter {
                 )));
             }
             if self.prev_boot_id == *boot_id
-                && self.tailentry_monotonic != 0
                 && monotonic < self.tailentry_monotonic
             {
                 return Err(Error::InvalidFile(format!(
@@ -4285,43 +4322,24 @@ pub fn journal_file_dispose(_dir_fd: Option<i32>, path: &str) -> Result<()> {
         .strip_suffix(".journal")
         .ok_or_else(|| Error::InvalidFile("dispose: path does not end in .journal".into()))?;
 
-    // Best-effort hole punching on Linux to release disk blocks before rename.
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        if let Ok(file) = File::open(path) {
-            if let Ok(meta) = file.metadata() {
-                let size = meta.len();
-                if size > 0 {
-                    // FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE = 0x02 | 0x01 = 0x03
-                    unsafe {
-                        libc::fallocate(
-                            file.as_raw_fd(),
-                            0x03, // FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
-                            0,
-                            size as libc::off_t,
-                        );
-                    }
-                }
-            }
-        }
-    }
+    // Note: systemd's journal_file_dispose does NOT modify file contents.
+    // No hole-punching — just rename.
 
-    // Generate random suffix: read 4 bytes from /dev/urandom (matching
-    // systemd's random_u64, truncated to u32 for the filename format).
-    let random_suffix: u32 = {
+    // Generate random suffix: read 8 bytes from /dev/urandom (matching
+    // systemd's random_u64() which produces a full u64).
+    let random_suffix: u64 = {
         use std::io::Read;
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; 8];
         if let Ok(mut f) = File::open("/dev/urandom") {
             let _ = f.read_exact(&mut buf);
         }
-        u32::from_ne_bytes(buf)
+        u64::from_ne_bytes(buf)
     };
 
     let rt = realtime_now();
 
-    // Construct the new name: {base}@{realtime:016x}-{random:08x}.journal~
-    let new_name = format!("{}@{:016x}-{:08x}.journal~", base, rt, random_suffix);
+    // Construct the new name: {base}@{realtime:016x}-{random:016x}.journal~
+    let new_name = format!("{}@{:016x}-{:016x}.journal~", base, rt, random_suffix);
     let new_path = p.with_file_name(&new_name);
 
     std::fs::rename(path, &new_path).map_err(|e| {
