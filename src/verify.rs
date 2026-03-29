@@ -719,9 +719,16 @@ fn verify_data_object(
         let n_items = entry_array_n_items(ea_size, compact);
 
         for i in 0..n_items {
+            if counted >= n_entries {
+                break; // trailing zero-padding slots are expected
+            }
             let entry_off = read_entry_array_item(file, cur_array, i, compact)?;
             if entry_off == 0 {
-                break;
+                // systemd: p <= last (last=0) catches zeros within the valid range
+                return Err(Error::InvalidFile(format!(
+                    "DATA at {:#x} entry array at {:#x} has zero entry at slot {} (within n_entries={})",
+                    data_off, cur_array, i, n_entries
+                )));
             }
 
             // V-06: monotonic ordering check for per-data chain
@@ -940,6 +947,13 @@ fn verify_entry_array(
     n_entries: u64,
 ) -> Result<()> {
     if entry_array_offset == 0 {
+        // systemd: journal-verify.c:719 — if entry_array_offset==0 but n_entries>0, that's corrupt
+        if n_entries > 0 {
+            return Err(Error::InvalidFile(format!(
+                "header has n_entries={} but entry_array_offset is 0",
+                n_entries
+            )));
+        }
         return Ok(());
     }
 
@@ -975,9 +989,16 @@ fn verify_entry_array(
         let n_items = entry_array_n_items(ea_size, compact);
 
         for i in 0..n_items {
+            if total_seen >= n_entries {
+                break; // trailing zero-padding slots are expected
+            }
             let entry_off = read_entry_array_item(file, cur_array, i, compact)?;
             if entry_off == 0 {
-                break;
+                // systemd: p <= last (last=0) catches zeros within the valid range
+                return Err(Error::InvalidFile(format!(
+                    "main entry array at {:#x} has zero entry at slot {} (within n_entries={})",
+                    cur_array, i, n_entries
+                )));
             }
 
             if !entry_offsets.contains(&entry_off) {
@@ -1137,6 +1158,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
     let mut n_fields: u64 = 0;
     let mut n_entry_arrays: u64 = 0;
     let mut n_tags: u64 = 0;
+    let mut last_tag_epoch: u64 = 0;
     let mut n_data_hash_tables: u64 = 0;
     let mut n_field_hash_tables: u64 = 0;
 
@@ -1383,6 +1405,42 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                 n_entry_arrays += 1;
             }
             ObjectType::Tag => {
+                // systemd: journal-verify.c:1120-1154
+                // Tag must only appear in sealed journals
+                if (compat & compat::SEALED) == 0 {
+                    return Err(Error::InvalidFile(format!(
+                        "TAG object at {:#x} in file without SEALED compat flag",
+                        p
+                    )));
+                }
+                // seqnum must be n_tags + 1 (1-based, sequential)
+                let tag_seqnum = read_u64_at(&mut file, p + 16)?;
+                if tag_seqnum != n_tags + 1 {
+                    return Err(Error::InvalidFile(format!(
+                        "TAG at {:#x}: seqnum {} != expected {}",
+                        p, tag_seqnum, n_tags + 1
+                    )));
+                }
+                let tag_epoch = read_u64_at(&mut file, p + 24)?;
+                if (compat & compat::SEALED_CONTINUOUS) != 0 {
+                    // SEALED_CONTINUOUS: epoch must be last_epoch or last_epoch+1
+                    // (first two tags are exempt: n_tags==0 means first tag, no previous)
+                    if n_tags > 0 && tag_epoch != last_tag_epoch && tag_epoch != last_tag_epoch + 1 {
+                        return Err(Error::InvalidFile(format!(
+                            "TAG at {:#x}: epoch {} not continuous (expected {} or {})",
+                            p, tag_epoch, last_tag_epoch, last_tag_epoch + 1
+                        )));
+                    }
+                } else {
+                    // Non-continuous: epoch must be non-decreasing
+                    if tag_epoch < last_tag_epoch {
+                        return Err(Error::InvalidFile(format!(
+                            "TAG at {:#x}: epoch {} < previous epoch {}",
+                            p, tag_epoch, last_tag_epoch
+                        )));
+                    }
+                }
+                last_tag_epoch = tag_epoch;
                 n_tags += 1;
             }
             _ => {}
@@ -1435,8 +1493,9 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
 
     // V-14: Only check n_data, n_fields, n_tags, n_entry_arrays if the header
     // is large enough to contain those fields (JOURNAL_HEADER_CONTAINS equivalent).
-    // n_data: offset 232, size 8 -> requires header_size >= 240
-    if header_size >= 240 {
+    // systemd: JOURNAL_HEADER_CONTAINS(h, field) = header_size >= offsetof(Header, field) + sizeof(field)
+    // n_data: offset 208, size 8 -> requires header_size >= 216
+    if header_size >= 216 {
         let h_n_data = from_le64(&header.n_data);
         if n_data != h_n_data {
             return Err(Error::InvalidFile(format!(
@@ -1446,8 +1505,8 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         }
     }
 
-    // n_fields: offset 240, size 8 -> requires header_size >= 248
-    if header_size >= 248 {
+    // n_fields: offset 216, size 8 -> requires header_size >= 224
+    if header_size >= 224 {
         let h_n_fields = from_le64(&header.n_fields);
         if n_fields != h_n_fields {
             return Err(Error::InvalidFile(format!(
@@ -1457,8 +1516,8 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         }
     }
 
-    // n_tags: offset 248, size 8 -> requires header_size >= 256
-    if header_size >= 256 {
+    // n_tags: offset 224, size 8 -> requires header_size >= 232
+    if header_size >= 232 {
         let h_n_tags = from_le64(&header.n_tags);
         if n_tags != h_n_tags {
             return Err(Error::InvalidFile(format!(
@@ -1468,8 +1527,8 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         }
     }
 
-    // n_entry_arrays: offset 256, size 8 -> requires header_size >= 264
-    if header_size >= 264 {
+    // n_entry_arrays: offset 232, size 8 -> requires header_size >= 240
+    if header_size >= 240 {
         let h_n_entry_arrays = from_le64(&header.n_entry_arrays);
         if n_entry_arrays != h_n_entry_arrays {
             return Err(Error::InvalidFile(format!(
@@ -1529,8 +1588,9 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
             entry_array_off
         )));
     }
-    // Note: systemd does NOT check for entry_array_offset==0 when entries exist.
-    // We skip this check for compatibility.
+    // systemd: journal-verify.c:719 — if entry_array_offset==0 during the second-pass
+    // entry array walk when n_entries>0, it returns "Array chain too short" (-EBADMSG).
+    // This check is now enforced in verify_entry_array via the n_entries parameter.
 
     // -- Second pass: cross-reference verification ------------------------
 

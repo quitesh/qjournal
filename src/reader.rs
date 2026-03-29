@@ -406,21 +406,17 @@ impl JournalReader {
         // Read head_hash_offset from the hash table bucket
         let mut p = self.read_u64_at(item_off)?;
 
-        // systemd: get_next_hash_offset tracks depth and detects loops
-        let mut depth: u32 = 0;
-
+        // systemd: get_next_hash_offset detects loops via monotonicity check (nextp <= p)
         while p > 0 {
-            depth += 1;
-            if depth > 1_000_000 {
-                return Err(Error::InvalidFile("hash chain loop detected (depth exceeded 1,000,000)".into()));
-            }
-
             let (_, _obj_size) = self.move_to_object(ObjectType::Data, p)?;
 
             let stored_hash = self.read_u64_at(p + 16)?; // data.hash
+            let nextp = self.read_u64_at(p + 24)?; // data.next_hash_offset
             if stored_hash != hash {
-                // Advance to next in chain
-                p = self.read_u64_at(p + 24)?; // data.next_hash_offset
+                if nextp > 0 && nextp <= p {
+                    return Err(Error::InvalidFile("data hash chain loop detected".into()));
+                }
+                p = nextp;
                 continue;
             }
 
@@ -430,7 +426,10 @@ impl JournalReader {
                 return Ok(Some(p));
             }
 
-            p = self.read_u64_at(p + 24)?;
+            if nextp > 0 && nextp <= p {
+                return Err(Error::InvalidFile("data hash chain loop detected".into()));
+            }
+            p = nextp;
         }
 
         Ok(None)
@@ -787,8 +786,9 @@ impl JournalReader {
         let mut k: u64 = 0;
 
         // Try chain cache
+        // systemd: only uses cache when i > ci->total (strictly greater)
         if let Some(ci) = self.chain_cache.get(&first).cloned() {
-            if i >= ci.total {
+            if i > ci.total {
                 a = ci.array;
                 i -= ci.total;
                 t = ci.total;

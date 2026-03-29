@@ -707,12 +707,12 @@ pub fn verify_header(
 
     // systemd: journal-file.c:588
     // If SEALED compat flag is set, the header must be large enough to contain
-    // the n_entry_arrays field (offset 256, so header_size must be >= 264).
+    // the n_entry_arrays field (offset 232, so header_size must be >= 240).
     {
         let compat = from_le32(&header.compatible_flags);
         if (compat & compat::SEALED) != 0 {
-            // n_entry_arrays is at byte offset 256 in the header struct, size 8.
-            const N_ENTRY_ARRAYS_END: u64 = 264;
+            // n_entry_arrays is at byte offset 232 in the header struct, size 8.
+            const N_ENTRY_ARRAYS_END: u64 = 240;
             if header_size < N_ENTRY_ARRAYS_END {
                 return Err(Error::InvalidFile(
                     "SEALED flag set but header too small for n_entry_arrays field".into(),
@@ -889,17 +889,17 @@ pub fn verify_header(
         ));
     }
     // systemd: journal-file.c:631 — tail_entry_array_n_entries must not exceed the space
-    // available in the entry array object at tail_entry_array_offset.
+    // available from tail_entry_array_offset to end of file.
+    // systemd check: n * item_size > header_size + arena_size - tail_entry_array_offset
+    // (uses raw region size, not subtracting the entry array object header)
     if tail_entry_array_offset != 0 && tail_entry_array_n_entries > 0 {
         let compact = (incompat & incompat::COMPACT) != 0;
         let item_sz = entry_array_item_size(compact);
-        // Maximum object size: from tail_entry_array_offset to end of arena (total).
         let max_obj_size = total.saturating_sub(tail_entry_array_offset);
-        let max_items = entry_array_n_items(max_obj_size, compact);
-        if tail_entry_array_n_entries > max_items {
+        if tail_entry_array_n_entries.saturating_mul(item_sz) > max_obj_size {
             return Err(Error::InvalidFile(format!(
-                "tail_entry_array_n_entries ({}) exceeds available space ({} items, item_sz={})",
-                tail_entry_array_n_entries, max_items, item_sz
+                "tail_entry_array_n_entries ({}) * item_sz ({}) > region_size ({})",
+                tail_entry_array_n_entries, item_sz, max_obj_size
             )));
         }
     }
@@ -1347,11 +1347,21 @@ impl JournalWriter {
     // systemd: journal-file.c journal_file_init_header() + journal_file_setup_data_hash_table()
     //          + journal_file_setup_field_hash_table().
 
+    /// systemd: parse_boolean() — accept "1"/"yes"/"true"/"on" as true,
+    /// "0"/"no"/"false"/"off" as false.
+    fn parse_boolean(s: &str) -> Option<bool> {
+        match s.to_lowercase().as_str() {
+            "1" | "yes" | "true" | "on" => Some(true),
+            "0" | "no" | "false" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
     /// Check if keyed hash is requested via SYSTEMD_JOURNAL_KEYED_HASH env var.
     /// Defaults to true if not set.
     fn keyed_hash_requested() -> bool {
         match std::env::var("SYSTEMD_JOURNAL_KEYED_HASH") {
-            Ok(v) => v != "0" && v.to_lowercase() != "false",
+            Ok(v) => Self::parse_boolean(&v).unwrap_or(true),
             Err(_) => true,
         }
     }
@@ -1360,7 +1370,7 @@ impl JournalWriter {
     /// Defaults to true if not set.
     fn compact_mode_requested() -> bool {
         match std::env::var("SYSTEMD_JOURNAL_COMPACT") {
-            Ok(v) => v != "0" && v.to_lowercase() != "false",
+            Ok(v) => Self::parse_boolean(&v).unwrap_or(true),
             Err(_) => true, // default: enabled, matching systemd
         }
     }
