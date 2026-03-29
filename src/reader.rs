@@ -1703,14 +1703,16 @@ impl JournalReader {
                     if seen >= n_entries {
                         break;
                     }
+                    // Count every slot (null or not) toward seen, matching systemd's
+                    // index-based traversal which advances regardless of slot content.
+                    seen += 1;
                     let eoff = self.entry_array_item(arr_off, slot)?;
                     if eoff != 0 {
                         match self.read_entry_at(eoff) {
                             Ok(e) => results.push(e),
                             Err(ref e) if Self::is_corruption_error(e) => {} // skip corrupt
-                Err(e) => return Err(e), // propagate I/O errors
+                            Err(e) => return Err(e), // propagate I/O errors
                         }
-                        seen += 1;
                     }
                 }
                 arr_off = next;

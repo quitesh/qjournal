@@ -164,26 +164,6 @@ fn verify_object(
                 });
             }
 
-            // entry_array_offset consistency with n_entries
-            if n_entries > 1 && entry_array_offset == 0 {
-                return Err(Error::CorruptObject {
-                    offset,
-                    reason: format!(
-                        "DATA n_entries={} > 1 but entry_array_offset is 0",
-                        n_entries
-                    ),
-                });
-            }
-            if n_entries <= 1 && entry_array_offset != 0 {
-                return Err(Error::CorruptObject {
-                    offset,
-                    reason: format!(
-                        "DATA n_entries={} <= 1 but entry_array_offset={:#x} is non-zero",
-                        n_entries, entry_array_offset
-                    ),
-                });
-            }
-
             // systemd: journal-verify.c:191-201 VALID64 checks
             if next_hash_offset != 0 && !valid64(next_hash_offset) {
                 return Err(Error::CorruptObject {
@@ -1423,12 +1403,21 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                 }
                 let tag_epoch = read_u64_at(&mut file, p + 24)?;
                 if (compat & compat::SEALED_CONTINUOUS) != 0 {
-                    // SEALED_CONTINUOUS: epoch must be last_epoch or last_epoch+1
-                    // (first two tags are exempt: n_tags==0 means first tag, no previous)
-                    if n_tags > 0 && tag_epoch != last_tag_epoch && tag_epoch != last_tag_epoch + 1 {
+                    // SEALED_CONTINUOUS epoch rules (systemd: journal-verify.c:1135-1144):
+                    // - 1st tag (n_tags==0): any epoch is OK
+                    // - 2nd tag (n_tags==1): epoch may equal last OR advance by 1
+                    // - 3rd+ tag (n_tags>=2): epoch must advance by exactly 1
+                    if n_tags == 1 {
+                        if tag_epoch != last_tag_epoch && tag_epoch != last_tag_epoch + 1 {
+                            return Err(Error::InvalidFile(format!(
+                                "TAG at {:#x}: epoch {} not continuous (expected {} or {})",
+                                p, tag_epoch, last_tag_epoch, last_tag_epoch + 1
+                            )));
+                        }
+                    } else if n_tags > 1 && tag_epoch != last_tag_epoch + 1 {
                         return Err(Error::InvalidFile(format!(
-                            "TAG at {:#x}: epoch {} not continuous (expected {} or {})",
-                            p, tag_epoch, last_tag_epoch, last_tag_epoch + 1
+                            "TAG at {:#x}: epoch {} not continuous (expected {})",
+                            p, tag_epoch, last_tag_epoch + 1
                         )));
                     }
                 } else {
@@ -1608,20 +1597,30 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
     // 2. Verify each entry's data items exist and are reachable from hash table
     //    V-02: Also verify reverse links (data->entry) with last-entry exemption
     //
-    // Determine the last entry in the main array chain (systemd: last entry by position
-    // in the main entry array, not by file offset order).
+    // Build the set of entries in the main entry array chain, bounded by n_entries.
+    // Only entries in this set get verify_entry called on them.
+    // systemd: verify_entry is only called from verify_entry_array, which only
+    // processes entries referenced by the main array (journal-verify.c:693-772).
+    // Also determines the last entry for the is_last exemption.
+    let mut main_entry_set: HashSet<u64> = HashSet::new();
     let last_array_entry: u64 = {
         let mut last = 0u64;
+        let mut total_seen = 0u64;
         let mut cur = entry_array_off;
-        while cur != 0 {
+        while cur != 0 && total_seen < n_entries {
             let ea_size = read_u64_at(&mut file, cur + 8).unwrap_or(0);
             let n = entry_array_n_items(ea_size, compact);
             for i in 0..n {
+                if total_seen >= n_entries {
+                    break;
+                }
                 let off = read_entry_array_item(&mut file, cur, i, compact).unwrap_or(0);
                 if off == 0 {
                     break;
                 }
+                main_entry_set.insert(off);
                 last = off;
+                total_seen += 1;
             }
             let next = read_u64_at(&mut file, cur + 16).unwrap_or(0);
             if next == 0 || next <= cur {
@@ -1644,19 +1643,24 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
             let obj_size2 = read_u64_at(&mut file, p2 + 8)?;
 
             if obj_type_byte2 == ObjectType::Entry as u8 {
-                // is_last: matches the last entry in the main array chain
-                // (systemd: journal-verify.c:759 `last = i + 1 == n`)
-                let is_last = last_array_entry != 0 && p2 == last_array_entry;
-                verify_entry(
-                    &mut file,
-                    p2,
-                    obj_size2,
-                    compact,
-                    &data_offsets,
-                    data_ht_offset,
-                    data_ht_size,
-                    is_last,
-                )?;
+                // Only verify entries that appear in the main entry array.
+                // systemd: verify_entry called only from verify_entry_array for
+                // entries referenced by the main array (not orphan entry objects).
+                if main_entry_set.contains(&p2) {
+                    // is_last: matches the last entry by position in main array
+                    // (systemd: journal-verify.c:759 `last = i + 1 == n`)
+                    let is_last = last_array_entry != 0 && p2 == last_array_entry;
+                    verify_entry(
+                        &mut file,
+                        p2,
+                        obj_size2,
+                        compact,
+                        &data_offsets,
+                        data_ht_offset,
+                        data_ht_size,
+                        is_last,
+                    )?;
+                }
             }
 
             if p2 == tail_object_offset {
