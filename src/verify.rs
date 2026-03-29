@@ -299,13 +299,9 @@ fn verify_object(
                 });
             }
 
-            // Field name must not contain '='
-            if payload.contains(&b'=') {
-                return Err(Error::CorruptObject {
-                    offset,
-                    reason: "FIELD payload contains '=' (invalid in field name)".into(),
-                });
-            }
+            // Note: systemd journal-verify.c:206-238 does NOT check for '=' in
+            // FIELD payloads during verification. The '=' check only applies in the
+            // writer. Removing it here matches systemd's accept/reject behavior.
 
             // Pointer alignment checks
             let next_hash_offset = read_u64_at(file, offset + 24)?;
@@ -651,6 +647,7 @@ fn verify_data_object(
     file: &mut File,
     data_off: u64,
     main_entry_set: &HashSet<u64>,
+    entry_array_offsets: &HashSet<u64>,
     compact: bool,
 ) -> Result<()> {
     let entry_offset = read_u64_at(file, data_off + 40)?;
@@ -687,6 +684,13 @@ fn verify_data_object(
     // Walk the entry array chain
     let mut cur_array = entry_array_offset;
     while cur_array != 0 {
+        // systemd: journal-verify.c:477 contains_uint64(cache_entry_array_fd, n_entry_arrays, a)
+        if !entry_array_offsets.contains(&cur_array) {
+            return Err(Error::InvalidFile(format!(
+                "DATA at {:#x} entry_array chain references {:#x} which was not seen in pass 1",
+                data_off, cur_array
+            )));
+        }
         let ea_size = read_u64_at(file, cur_array + 8)?;
         let n_items = entry_array_n_items(ea_size, compact);
 
@@ -760,6 +764,7 @@ fn verify_data_hash_table(
     data_offsets: &HashSet<u64>,
     n_data: u64,
     main_entry_set: &HashSet<u64>,
+    entry_array_offsets: &HashSet<u64>,
     compact: bool,
 ) -> Result<()> {
     if data_ht_offset == 0 || data_ht_size == 0 {
@@ -809,7 +814,7 @@ fn verify_data_hash_table(
             }
 
             // V-01: verify this data object's entry references
-            verify_data_object(file, cur, main_entry_set, compact)?;
+            verify_data_object(file, cur, main_entry_set, entry_array_offsets, compact)?;
 
             total_data_count += 1;
             last = cur;
@@ -1154,6 +1159,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
     // Offset tracking for cross-reference
     let mut data_offsets: HashSet<u64> = HashSet::new();
     let mut entry_offsets: HashSet<u64> = HashSet::new();
+    let mut entry_array_offsets: HashSet<u64> = HashSet::new();
     let mut found_main_entry_array = false;
 
     // First pass: walk all objects sequentially
@@ -1382,6 +1388,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                     }
                     found_main_entry_array = true;
                 }
+                entry_array_offsets.insert(p);
                 n_entry_arrays += 1;
             }
             ObjectType::Tag => {
@@ -1626,6 +1633,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         &data_offsets,
         n_data,
         &main_entry_set,
+        &entry_array_offsets,
         compact,
     )?;
 
