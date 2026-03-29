@@ -1297,8 +1297,10 @@ impl JournalReader {
 
         if direction == Direction::Down {
             if r == TEST_FOUND || r == TEST_RIGHT {
-                // Extra is the answer
-                let _ = self.move_to_object(ObjectType::Entry, extra)?;
+                // Extra is the answer.
+                // systemd: journal-file.c:3268 (use_extra label) — returns extra without
+                // structural validation; move_to_object is only called if ret_object != NULL.
+                // qjournal callers don't need the object returned, so skip validation.
                 return Ok(Some(extra));
             }
         } else {
@@ -1313,9 +1315,9 @@ impl JournalReader {
             return Ok(Some(p));
         }
 
-        // Nothing found in chain; for UP, use the extra
+        // Nothing found in chain; for UP, use the extra.
+        // systemd: same use_extra path, no validation when ret_object == NULL.
         if direction == Direction::Up && extra != 0 {
-            let _ = self.move_to_object(ObjectType::Entry, extra)?;
             return Ok(Some(extra));
         }
 
