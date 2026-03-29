@@ -509,8 +509,11 @@ fn verify_object(
                     read_u64_at(file, item_off)?
                 };
 
+                // systemd: journal-verify.c:355-360 — `q != 0 && !VALID64(q)`.
+                // Zero slots are silently skipped (not an error); continue to check
+                // all remaining slots for non-zero unaligned offsets.
                 if entry_off == 0 {
-                    break; // unused slots at end
+                    continue;
                 }
 
                 if !valid64(entry_off) {
