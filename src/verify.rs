@@ -112,7 +112,7 @@ fn verify_object(
     compact: bool,
     keyed_hash: bool,
     file_id: &[u8; 16],
-    seqnum_id: &[u8; 16],
+    _seqnum_id: &[u8; 16],
 ) -> Result<()> {
     let otype = ObjectType::try_from(obj_type).map_err(|_| Error::CorruptObject {
         offset,
@@ -160,26 +160,6 @@ fn verify_object(
                     reason: format!(
                         "DATA entry_offset={:#x} but n_entries={}",
                         entry_offset, n_entries
-                    ),
-                });
-            }
-
-            // entry_array_offset consistency with n_entries
-            if n_entries > 1 && entry_array_offset == 0 {
-                return Err(Error::CorruptObject {
-                    offset,
-                    reason: format!(
-                        "DATA n_entries={} > 1 but entry_array_offset is 0",
-                        n_entries
-                    ),
-                });
-            }
-            if n_entries <= 1 && entry_array_offset != 0 {
-                return Err(Error::CorruptObject {
-                    offset,
-                    reason: format!(
-                        "DATA n_entries={} <= 1 but entry_array_offset={:#x} is non-zero",
-                        n_entries, entry_array_offset
                     ),
                 });
             }
@@ -290,13 +270,8 @@ fn verify_object(
                 });
             }
 
-            // Verify payload contains '='
-            if !payload.contains(&b'=') {
-                return Err(Error::CorruptObject {
-                    offset,
-                    reason: "DATA payload missing '=' separator".into(),
-                });
-            }
+            // Note: systemd does not check for '=' in DATA payloads at the verify level.
+            // Binary data objects may not contain '='. We skip this check for compatibility.
         }
         ObjectType::Field => {
             // systemd: journal-verify.c:206-238
@@ -324,13 +299,9 @@ fn verify_object(
                 });
             }
 
-            // Field name must not contain '='
-            if payload.contains(&b'=') {
-                return Err(Error::CorruptObject {
-                    offset,
-                    reason: "FIELD payload contains '=' (invalid in field name)".into(),
-                });
-            }
+            // Note: systemd journal-verify.c:206-238 does NOT check for '=' in
+            // FIELD payloads during verification. The '=' check only applies in the
+            // writer. Removing it here matches systemd's accept/reject behavior.
 
             // Pointer alignment checks
             let next_hash_offset = read_u64_at(file, offset + 24)?;
@@ -390,18 +361,6 @@ fn verify_object(
                 });
             }
 
-            // seqnum_id null XOR seqnum zero consistency
-            let seqnum_id_is_null = *seqnum_id == [0u8; 16];
-            if seqnum_id_is_null != (seqnum == 0) {
-                return Err(Error::CorruptObject {
-                    offset,
-                    reason: format!(
-                        "ENTRY seqnum_id null ({}) inconsistent with seqnum={}",
-                        seqnum_id_is_null, seqnum
-                    ),
-                });
-            }
-
             // VALID_REALTIME: u > 0 && u < (1<<55)
             let realtime = read_u64_at(file, offset + 24)?;
             if realtime == 0 || realtime >= TIMESTAMP_UPPER {
@@ -420,14 +379,8 @@ fn verify_object(
                 });
             }
 
-            // boot_id must not be null
-            let boot_bytes = read_bytes_at(file, offset + 40, 16)?;
-            if boot_bytes == [0u8; 16] {
-                return Err(Error::CorruptObject {
-                    offset,
-                    reason: "ENTRY boot_id is null".into(),
-                });
-            }
+            // Note: systemd does not check for null boot_id in verify_object.
+            // We skip that check for compatibility.
 
             // Verify each entry item has valid offset
             for i in 0..n_items {
@@ -519,12 +472,12 @@ fn verify_object(
             let ea_item_sz = entry_array_item_size(compact);
             let items_bytes = obj_size.saturating_sub(ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64);
 
-            // Size modulo check
-            if items_bytes % ea_item_sz != 0 {
+            // Size modulo check and n_items > 0 (systemd: journal-verify.c:337-338)
+            if items_bytes % ea_item_sz != 0 || items_bytes / ea_item_sz == 0 {
                 return Err(Error::CorruptObject {
                     offset,
                     reason: format!(
-                        "ENTRY_ARRAY items region {} not divisible by {}",
+                        "ENTRY_ARRAY items region {} not divisible by {} or has zero items",
                         items_bytes, ea_item_sz
                     ),
                 });
@@ -542,9 +495,11 @@ fn verify_object(
                 });
             }
 
-            // Per-item VALID64 and monotonicity check
+            // Per-item VALID64 check only.
+            // systemd: journal-verify.c:342-360 — only checks VALID64, no monotonicity.
+            // Monotonicity is checked in the second-pass verify_data / verify_entry_array
+            // for referenced arrays only. Orphaned entry arrays are not checked at all.
             let n_items = entry_array_n_items(obj_size, compact);
-            let mut prev_off = 0u64;
             for i in 0..n_items {
                 let item_off =
                     offset + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + i * ea_item_sz;
@@ -554,8 +509,11 @@ fn verify_object(
                     read_u64_at(file, item_off)?
                 };
 
+                // systemd: journal-verify.c:355-360 — `q != 0 && !VALID64(q)`.
+                // Zero slots are silently skipped (not an error); continue to check
+                // all remaining slots for non-zero unaligned offsets.
                 if entry_off == 0 {
-                    break; // unused slots at end
+                    continue;
                 }
 
                 if !valid64(entry_off) {
@@ -567,17 +525,6 @@ fn verify_object(
                         ),
                     });
                 }
-
-                if entry_off <= prev_off && prev_off != 0 {
-                    return Err(Error::CorruptObject {
-                        offset,
-                        reason: format!(
-                            "ENTRY_ARRAY item {} offset {:#x} <= previous {:#x}",
-                            i, entry_off, prev_off
-                        ),
-                    });
-                }
-                prev_off = entry_off;
             }
         }
         ObjectType::Tag => {
@@ -648,18 +595,180 @@ fn data_object_in_hash_table(
     Ok(false)
 }
 
+/// Check whether a data object's entry chain (inline entry_offset + entry_array chain)
+/// contains the given entry offset.
+///
+/// systemd: journal-verify.c:563-691 (verify_entry calls journal_file_move_to_entry_by_offset_for_data)
+fn data_object_entry_chain_contains(
+    file: &mut File,
+    data_off: u64,
+    target_entry_off: u64,
+    compact: bool,
+) -> Result<bool> {
+    // Check inline entry_offset
+    let entry_offset = read_u64_at(file, data_off + 40)?;
+    if entry_offset == target_entry_off {
+        return Ok(true);
+    }
+
+    // Walk entry_array chain
+    let mut cur_array = read_u64_at(file, data_off + 48)?;
+    while cur_array != 0 {
+        let ea_size = read_u64_at(file, cur_array + 8)?;
+        let n_items = entry_array_n_items(ea_size, compact);
+
+        for i in 0..n_items {
+            let entry_off = read_entry_array_item(file, cur_array, i, compact)?;
+            if entry_off == 0 {
+                return Ok(false);
+            }
+            if entry_off == target_entry_off {
+                return Ok(true);
+            }
+        }
+
+        let next_ea = read_u64_at(file, cur_array + 16)?;
+        if next_ea != 0 && next_ea <= cur_array {
+            break; // cycle protection
+        }
+        cur_array = next_ea;
+    }
+
+    Ok(false)
+}
+
+/// V-01: Verify a single data object's entry references.
+///
+/// systemd: journal-verify.c:425-525 verify_data
+///
+/// For each data object, verify:
+/// - Each entry in its chain is in the main entry array (not just any ENTRY object)
+///   systemd: contains_uint64 + journal_file_move_to_entry_by_offset checks
+/// - entry_array_offset != 0 implies n_entries >= 2 (V-06)
+/// - Monotonic ordering of entries in per-data chain (V-06)
+fn verify_data_object(
+    file: &mut File,
+    data_off: u64,
+    main_entry_set: &HashSet<u64>,
+    entry_array_offsets: &HashSet<u64>,
+    compact: bool,
+) -> Result<()> {
+    let entry_offset = read_u64_at(file, data_off + 40)?;
+    let entry_array_offset = read_u64_at(file, data_off + 48)?;
+    let n_entries = read_u64_at(file, data_off + 56)?;
+
+    // V-06: entry_array_offset != 0 implies n_entries >= 2
+    if entry_array_offset != 0 && n_entries < 2 {
+        return Err(Error::InvalidFile(format!(
+            "DATA at {:#x} has entry_array_offset={:#x} but n_entries={} (must be >= 2)",
+            data_off, entry_array_offset, n_entries
+        )));
+    }
+
+    if n_entries == 0 {
+        return Ok(());
+    }
+
+    let mut counted = 0u64;
+    let mut last_entry = 0u64;
+
+    // First entry is the inline one (entry_offset)
+    if entry_offset != 0 {
+        if !main_entry_set.contains(&entry_offset) {
+            return Err(Error::InvalidFile(format!(
+                "DATA at {:#x} inline entry_offset {:#x} is not in the main entry array",
+                data_off, entry_offset
+            )));
+        }
+        last_entry = entry_offset;
+        counted += 1;
+    }
+
+    // Walk the entry array chain
+    let mut cur_array = entry_array_offset;
+    while cur_array != 0 {
+        // systemd: journal-verify.c:477 contains_uint64(cache_entry_array_fd, n_entry_arrays, a)
+        if !entry_array_offsets.contains(&cur_array) {
+            return Err(Error::InvalidFile(format!(
+                "DATA at {:#x} entry_array chain references {:#x} which was not seen in pass 1",
+                data_off, cur_array
+            )));
+        }
+        let ea_size = read_u64_at(file, cur_array + 8)?;
+        let n_items = entry_array_n_items(ea_size, compact);
+
+        for i in 0..n_items {
+            if counted >= n_entries {
+                break; // trailing zero-padding slots are expected
+            }
+            let entry_off = read_entry_array_item(file, cur_array, i, compact)?;
+            if entry_off == 0 {
+                // systemd: p <= last (last=0) catches zeros within the valid range
+                return Err(Error::InvalidFile(format!(
+                    "DATA at {:#x} entry array at {:#x} has zero entry at slot {} (within n_entries={})",
+                    data_off, cur_array, i, n_entries
+                )));
+            }
+
+            // V-06: monotonic ordering check for per-data chain
+            if entry_off <= last_entry && last_entry != 0 {
+                return Err(Error::InvalidFile(format!(
+                    "DATA at {:#x} entry array not sorted ({:#x} <= {:#x})",
+                    data_off, entry_off, last_entry
+                )));
+            }
+            last_entry = entry_off;
+
+            if !main_entry_set.contains(&entry_off) {
+                return Err(Error::InvalidFile(format!(
+                    "DATA at {:#x} entry array references {:#x} which is not in the main entry array",
+                    data_off, entry_off
+                )));
+            }
+            counted += 1;
+        }
+
+        let next_ea = read_u64_at(file, cur_array + 16)?;
+        if next_ea != 0 && next_ea <= cur_array {
+            return Err(Error::InvalidFile(format!(
+                "DATA at {:#x} entry array chain loop: next {:#x} <= current {:#x}",
+                data_off, next_ea, cur_array
+            )));
+        }
+        cur_array = next_ea;
+    }
+
+    if counted != n_entries {
+        return Err(Error::InvalidFile(format!(
+            "DATA at {:#x} n_entries={} but counted {} in entry chain",
+            data_off, n_entries, counted
+        )));
+    }
+
+    Ok(())
+}
+
+/// Maximum allowed hash chain depth before we consider the file corrupt.
+/// This is a safety bound to prevent runaway verification on degenerate files.
+const MAX_HASH_CHAIN_DEPTH: u64 = 1024 * 1024;
+
 /// systemd: journal-verify.c:452-561 verify_data_hash_table
 ///
 /// Walk each bucket of the data hash table, verify:
 /// - Each referenced object is in `data_offsets`
 /// - Each object's hash maps to the correct bucket
 /// - Tail pointers match the last element in each chain
+/// - Call verify_data_object for each data object (V-01)
+/// - Enforce max chain depth (V-13)
 fn verify_data_hash_table(
     file: &mut File,
     data_ht_offset: u64,
     data_ht_size: u64,
     data_offsets: &HashSet<u64>,
     n_data: u64,
+    main_entry_set: &HashSet<u64>,
+    entry_array_offsets: &HashSet<u64>,
+    compact: bool,
 ) -> Result<()> {
     if data_ht_offset == 0 || data_ht_size == 0 {
         return Ok(());
@@ -676,8 +785,18 @@ fn verify_data_hash_table(
         let mut last = 0u64;
         #[allow(unused_assignments)]
         let mut prev = 0u64;
+        let mut chain_depth: u64 = 0;
 
         while cur != 0 {
+            // V-13: enforce max chain depth
+            chain_depth += 1;
+            if chain_depth > MAX_HASH_CHAIN_DEPTH {
+                return Err(Error::InvalidFile(format!(
+                    "data hash table bucket {} chain depth exceeds maximum ({})",
+                    bucket, MAX_HASH_CHAIN_DEPTH
+                )));
+            }
+
             if !data_offsets.contains(&cur) {
                 return Err(Error::InvalidFile(format!(
                     "data hash table bucket {} references {:#x} which is not a DATA object",
@@ -696,6 +815,9 @@ fn verify_data_hash_table(
                     bucket
                 )));
             }
+
+            // V-01: verify this data object's entry references
+            verify_data_object(file, cur, main_entry_set, entry_array_offsets, compact)?;
 
             total_data_count += 1;
             last = cur;
@@ -719,21 +841,22 @@ fn verify_data_hash_table(
         }
     }
 
-    if total_data_count != n_data {
-        return Err(Error::InvalidFile(format!(
-            "data hash table contains {} data objects but expected {}",
-            total_data_count, n_data
-        )));
-    }
+    // Note: systemd does NOT check that all DATA objects from pass 1 appear in the hash
+    // chains. Orphaned DATA objects (appended but not yet linked due to partial write)
+    // are tolerated by systemd. The pass-1 n_data count is validated against the header
+    // separately. We only verify that what the hash table points to is consistent.
+    let _ = total_data_count;
 
     Ok(())
 }
 
-/// systemd: journal-verify.c:563-641 verify_entry
+/// systemd: journal-verify.c:563-691 verify_entry
 ///
 /// For a single entry, verify each data item:
 /// - Points to a known DATA object
 /// - The DATA object is reachable from the hash table
+/// - V-02: The DATA object's entry chain contains this entry (reverse link check)
+///   with last-entry exemption (the last entry may not be fully linked yet)
 fn verify_entry(
     file: &mut File,
     entry_offset: u64,
@@ -742,6 +865,7 @@ fn verify_entry(
     data_offsets: &HashSet<u64>,
     data_ht_offset: u64,
     data_ht_size: u64,
+    is_last: bool,
 ) -> Result<()> {
     let item_sz = entry_item_size(compact);
     let items_bytes = obj_size.saturating_sub(ENTRY_OBJECT_HEADER_SIZE as u64);
@@ -772,6 +896,19 @@ fn verify_entry(
                 data_off, entry_offset, i
             )));
         }
+
+        // V-02: Verify the data object's entry chain contains this entry (reverse link check).
+        // The last entry object has a very high chance of not being referenced as journal
+        // files almost always run out of space during linking of entry items when trying
+        // to add a new entry array, so skip this check for the last entry.
+        if !is_last {
+            if !data_object_entry_chain_contains(file, data_off, entry_offset, compact)? {
+                return Err(Error::InvalidFile(format!(
+                    "ENTRY at {:#x} not referenced by linked DATA object at {:#x}",
+                    entry_offset, data_off
+                )));
+            }
+        }
     }
 
     Ok(())
@@ -786,9 +923,17 @@ fn verify_entry_array(
     entry_array_offset: u64,
     compact: bool,
     entry_offsets: &HashSet<u64>,
+    entry_array_offsets: &HashSet<u64>,
     n_entries: u64,
 ) -> Result<()> {
     if entry_array_offset == 0 {
+        // systemd: journal-verify.c:719 — if entry_array_offset==0 but n_entries>0, that's corrupt
+        if n_entries > 0 {
+            return Err(Error::InvalidFile(format!(
+                "header has n_entries={} but entry_array_offset is 0",
+                n_entries
+            )));
+        }
         return Ok(());
     }
 
@@ -797,6 +942,15 @@ fn verify_entry_array(
     let mut prev_entry_off = 0u64;
 
     while cur_array != 0 {
+        // systemd: journal-verify.c — contains_uint64(cache_entry_array_fd, n_entry_arrays, a)
+        // Each entry array offset must have been observed during the sequential pass-1 walk.
+        if !entry_array_offsets.contains(&cur_array) {
+            return Err(Error::InvalidFile(format!(
+                "entry array chain references {:#x} which was not seen in pass 1",
+                cur_array
+            )));
+        }
+
         // Verify type byte is EntryArray
         let type_byte = {
             file.seek(SeekFrom::Start(cur_array))?;
@@ -824,9 +978,16 @@ fn verify_entry_array(
         let n_items = entry_array_n_items(ea_size, compact);
 
         for i in 0..n_items {
+            if total_seen >= n_entries {
+                break; // trailing zero-padding slots are expected
+            }
             let entry_off = read_entry_array_item(file, cur_array, i, compact)?;
             if entry_off == 0 {
-                break;
+                // systemd: p <= last (last=0) catches zeros within the valid range
+                return Err(Error::InvalidFile(format!(
+                    "main entry array at {:#x} has zero entry at slot {} (within n_entries={})",
+                    cur_array, i, n_entries
+                )));
             }
 
             if !entry_offsets.contains(&entry_off) {
@@ -861,80 +1022,6 @@ fn verify_entry_array(
             "main entry array contains {} entries but header says {}",
             total_seen, n_entries
         )));
-    }
-
-    Ok(())
-}
-
-/// systemd: journal-verify.c:743-810 verify_data
-///
-/// For each data object, walk its per-data entry array chain and verify
-/// each referenced entry exists in `entry_offsets`.
-fn verify_data(
-    file: &mut File,
-    data_offsets: &HashSet<u64>,
-    entry_offsets: &HashSet<u64>,
-    compact: bool,
-) -> Result<()> {
-    for &data_off in data_offsets {
-        let entry_offset = read_u64_at(file, data_off + 40)?;
-        let entry_array_offset = read_u64_at(file, data_off + 48)?;
-        let n_entries = read_u64_at(file, data_off + 56)?;
-
-        if n_entries == 0 {
-            continue;
-        }
-
-        let mut counted = 0u64;
-
-        // First entry is the inline one (entry_offset)
-        if entry_offset != 0 {
-            if !entry_offsets.contains(&entry_offset) {
-                return Err(Error::InvalidFile(format!(
-                    "DATA at {:#x} inline entry_offset {:#x} is not a known ENTRY",
-                    data_off, entry_offset
-                )));
-            }
-            counted += 1;
-        }
-
-        // Walk the entry array chain
-        let mut cur_array = entry_array_offset;
-        while cur_array != 0 {
-            let ea_size = read_u64_at(file, cur_array + 8)?;
-            let n_items = entry_array_n_items(ea_size, compact);
-
-            for i in 0..n_items {
-                let entry_off = read_entry_array_item(file, cur_array, i, compact)?;
-                if entry_off == 0 {
-                    break;
-                }
-
-                if !entry_offsets.contains(&entry_off) {
-                    return Err(Error::InvalidFile(format!(
-                        "DATA at {:#x} entry array references {:#x} which is not a known ENTRY",
-                        data_off, entry_off
-                    )));
-                }
-                counted += 1;
-            }
-
-            let next_ea = read_u64_at(file, cur_array + 16)?;
-            if next_ea != 0 && next_ea <= cur_array {
-                return Err(Error::InvalidFile(format!(
-                    "DATA at {:#x} entry array chain loop: next {:#x} <= current {:#x}",
-                    data_off, next_ea, cur_array
-                )));
-            }
-            cur_array = next_ea;
-        }
-
-        if counted != n_entries {
-            return Err(Error::InvalidFile(format!(
-                "DATA at {:#x} n_entries={} but counted {} in entry chain",
-                data_off, n_entries, counted
-            )));
-        }
     }
 
     Ok(())
@@ -1060,6 +1147,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
     let mut n_fields: u64 = 0;
     let mut n_entry_arrays: u64 = 0;
     let mut n_tags: u64 = 0;
+    let mut last_tag_epoch: u64 = 0;
     let mut n_data_hash_tables: u64 = 0;
     let mut n_field_hash_tables: u64 = 0;
 
@@ -1073,6 +1161,9 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
     let mut min_entry_realtime: u64 = u64::MAX;
     let mut max_entry_realtime: u64 = 0;
 
+    // V-08: Track LAST entry realtime for tail_entry_realtime comparison
+    let mut last_entry_realtime: u64 = 0;
+
     // Track last entry monotonic/boot_id for tail check
     let mut last_entry_monotonic: u64 = 0;
     let mut last_entry_boot_id = [0u8; 16];
@@ -1080,6 +1171,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
     // Offset tracking for cross-reference
     let mut data_offsets: HashSet<u64> = HashSet::new();
     let mut entry_offsets: HashSet<u64> = HashSet::new();
+    let mut entry_array_offsets: HashSet<u64> = HashSet::new();
     let mut found_main_entry_array = false;
 
     // First pass: walk all objects sequentially
@@ -1175,6 +1267,14 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                 n_fields += 1;
             }
             ObjectType::Entry => {
+                // systemd: journal-verify.c:1259 — entries before first tag in sealed journals
+                if (compat & compat::SEALED) != 0 && n_tags == 0 {
+                    return Err(Error::InvalidFile(format!(
+                        "ENTRY at {:#x} appears before first TAG in sealed journal",
+                        p
+                    )));
+                }
+
                 let seqnum = read_u64_at(&mut file, p + 16)?;
                 let realtime = read_u64_at(&mut file, p + 24)?;
                 let monotonic = read_u64_at(&mut file, p + 32)?;
@@ -1222,6 +1322,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
 
                 last_entry_monotonic = monotonic;
                 last_entry_boot_id = boot_id;
+                last_entry_realtime = realtime;
 
                 // Realtime tracking
                 if !entry_realtime_set {
@@ -1299,9 +1400,55 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                     }
                     found_main_entry_array = true;
                 }
+                entry_array_offsets.insert(p);
                 n_entry_arrays += 1;
             }
             ObjectType::Tag => {
+                // systemd: journal-verify.c:1120-1154
+                // Tag must only appear in sealed journals
+                if (compat & compat::SEALED) == 0 {
+                    return Err(Error::InvalidFile(format!(
+                        "TAG object at {:#x} in file without SEALED compat flag",
+                        p
+                    )));
+                }
+                // seqnum must be n_tags + 1 (1-based, sequential)
+                let tag_seqnum = read_u64_at(&mut file, p + 16)?;
+                if tag_seqnum != n_tags + 1 {
+                    return Err(Error::InvalidFile(format!(
+                        "TAG at {:#x}: seqnum {} != expected {}",
+                        p, tag_seqnum, n_tags + 1
+                    )));
+                }
+                let tag_epoch = read_u64_at(&mut file, p + 24)?;
+                if (compat & compat::SEALED_CONTINUOUS) != 0 {
+                    // SEALED_CONTINUOUS epoch rules (systemd: journal-verify.c:1135-1144):
+                    // - 1st tag (n_tags==0): any epoch is OK
+                    // - 2nd tag (n_tags==1): epoch may equal last OR advance by 1
+                    // - 3rd+ tag (n_tags>=2): epoch must advance by exactly 1
+                    if n_tags == 1 {
+                        if tag_epoch != last_tag_epoch && tag_epoch != last_tag_epoch + 1 {
+                            return Err(Error::InvalidFile(format!(
+                                "TAG at {:#x}: epoch {} not continuous (expected {} or {})",
+                                p, tag_epoch, last_tag_epoch, last_tag_epoch + 1
+                            )));
+                        }
+                    } else if n_tags > 1 && tag_epoch != last_tag_epoch + 1 {
+                        return Err(Error::InvalidFile(format!(
+                            "TAG at {:#x}: epoch {} not continuous (expected {})",
+                            p, tag_epoch, last_tag_epoch + 1
+                        )));
+                    }
+                } else {
+                    // Non-continuous: epoch must be non-decreasing
+                    if tag_epoch < last_tag_epoch {
+                        return Err(Error::InvalidFile(format!(
+                            "TAG at {:#x}: epoch {} < previous epoch {}",
+                            p, tag_epoch, last_tag_epoch
+                        )));
+                    }
+                }
+                last_tag_epoch = tag_epoch;
                 n_tags += 1;
             }
             _ => {}
@@ -1352,36 +1499,51 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         )));
     }
 
-    let h_n_data = from_le64(&header.n_data);
-    if n_data != h_n_data {
-        return Err(Error::InvalidFile(format!(
-            "n_data mismatch: counted {} != header {}",
-            n_data, h_n_data
-        )));
+    // V-14: Only check n_data, n_fields, n_tags, n_entry_arrays if the header
+    // is large enough to contain those fields (JOURNAL_HEADER_CONTAINS equivalent).
+    // systemd: JOURNAL_HEADER_CONTAINS(h, field) = header_size >= offsetof(Header, field) + sizeof(field)
+    // n_data: offset 208, size 8 -> requires header_size >= 216
+    if header_size >= 216 {
+        let h_n_data = from_le64(&header.n_data);
+        if n_data != h_n_data {
+            return Err(Error::InvalidFile(format!(
+                "n_data mismatch: counted {} != header {}",
+                n_data, h_n_data
+            )));
+        }
     }
 
-    let h_n_fields = from_le64(&header.n_fields);
-    if n_fields != h_n_fields {
-        return Err(Error::InvalidFile(format!(
-            "n_fields mismatch: counted {} != header {}",
-            n_fields, h_n_fields
-        )));
+    // n_fields: offset 216, size 8 -> requires header_size >= 224
+    if header_size >= 224 {
+        let h_n_fields = from_le64(&header.n_fields);
+        if n_fields != h_n_fields {
+            return Err(Error::InvalidFile(format!(
+                "n_fields mismatch: counted {} != header {}",
+                n_fields, h_n_fields
+            )));
+        }
     }
 
-    let h_n_entry_arrays = from_le64(&header.n_entry_arrays);
-    if n_entry_arrays != h_n_entry_arrays {
-        return Err(Error::InvalidFile(format!(
-            "n_entry_arrays mismatch: counted {} != header {}",
-            n_entry_arrays, h_n_entry_arrays
-        )));
+    // n_tags: offset 224, size 8 -> requires header_size >= 232
+    if header_size >= 232 {
+        let h_n_tags = from_le64(&header.n_tags);
+        if n_tags != h_n_tags {
+            return Err(Error::InvalidFile(format!(
+                "n_tags mismatch: counted {} != header {}",
+                n_tags, h_n_tags
+            )));
+        }
     }
 
-    let h_n_tags = from_le64(&header.n_tags);
-    if n_tags != h_n_tags {
-        return Err(Error::InvalidFile(format!(
-            "n_tags mismatch: counted {} != header {}",
-            n_tags, h_n_tags
-        )));
+    // n_entry_arrays: offset 232, size 8 -> requires header_size >= 240
+    if header_size >= 240 {
+        let h_n_entry_arrays = from_le64(&header.n_entry_arrays);
+        if n_entry_arrays != h_n_entry_arrays {
+            return Err(Error::InvalidFile(format!(
+                "n_entry_arrays mismatch: counted {} != header {}",
+                n_entry_arrays, h_n_entry_arrays
+            )));
+        }
     }
 
     // Verify tail entry seqnum
@@ -1395,34 +1557,34 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         }
     }
 
-    // systemd: journal-verify.c:1331-1335 -- tail_entry_realtime hard error
+    // systemd: journal-verify.c:1348-1355 -- tail_entry_realtime hard error
+    // V-08: Use LAST entry realtime, not max, matching systemd's entry_realtime
     if n_entries > 0 {
         let tail_realtime = from_le64(&header.tail_entry_realtime);
-        if max_entry_realtime != tail_realtime {
+        if last_entry_realtime != tail_realtime {
             return Err(Error::InvalidFile(format!(
-                "tail_entry_realtime mismatch: max seen {} != header {}",
-                max_entry_realtime, tail_realtime
+                "tail_entry_realtime mismatch: last seen {} != header {}",
+                last_entry_realtime, tail_realtime
             )));
         }
     }
 
     // systemd: journal-verify.c:1336-1346 -- tail_entry_monotonic/boot_id
-    if n_entries > 0 {
+    // Only check tail_entry_monotonic when ALL THREE conditions hold:
+    //   1. TAIL_ENTRY_BOOT_ID flag is set
+    //   2. last entry's boot_id MATCHES header's tail_entry_boot_id
+    //   3. monotonic values differ
+    // If boot_id does NOT match, systemd silently skips (no error).
+    if n_entries > 0
+        && (compat & compat::TAIL_ENTRY_BOOT_ID) != 0
+        && last_entry_boot_id == header.tail_entry_boot_id
+    {
         let tail_monotonic = from_le64(&header.tail_entry_monotonic);
         if last_entry_monotonic != tail_monotonic {
             return Err(Error::InvalidFile(format!(
                 "tail_entry_monotonic mismatch: last seen {} != header {}",
                 last_entry_monotonic, tail_monotonic
             )));
-        }
-
-        if (compat & compat::TAIL_ENTRY_BOOT_ID) != 0
-            && last_entry_boot_id != header.tail_entry_boot_id
-        {
-            return Err(Error::InvalidFile(
-                "tail_entry_boot_id mismatch: last entry boot_id != header tail_entry_boot_id"
-                    .into(),
-            ));
         }
     }
 
@@ -1434,18 +1596,62 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
             entry_array_off
         )));
     }
-    if entry_array_off == 0 && n_entries > 0 {
-        return Err(Error::InvalidFile(
-            "entries exist but header entry_array_offset is 0".into(),
-        ));
-    }
+    // systemd: journal-verify.c:719 — if entry_array_offset==0 during the second-pass
+    // entry array walk when n_entries>0, it returns "Array chain too short" (-EBADMSG).
+    // This check is now enforced in verify_entry_array via the n_entries parameter.
 
     // -- Second pass: cross-reference verification ------------------------
 
-    // 1. Verify data hash table chains
-    verify_data_hash_table(&mut file, data_ht_offset, data_ht_size, &data_offsets, n_data)?;
+    // Build the set of entries in the main entry array chain, bounded by n_entries.
+    // - Used by verify_data_object to check that data-linked entries are in the main array
+    //   (systemd: journal_file_move_to_entry_by_offset check in verify_data)
+    // - Used to restrict verify_entry calls to main-array entries only
+    //   (systemd: verify_entry is only called from verify_entry_array)
+    // - Determines the last entry for the is_last exemption
+    let mut main_entry_set: HashSet<u64> = HashSet::new();
+    let last_array_entry: u64 = {
+        let mut last = 0u64;
+        let mut total_seen = 0u64;
+        let mut cur = entry_array_off;
+        while cur != 0 && total_seen < n_entries {
+            let ea_size = read_u64_at(&mut file, cur + 8).unwrap_or(0);
+            let n = entry_array_n_items(ea_size, compact);
+            for i in 0..n {
+                if total_seen >= n_entries {
+                    break;
+                }
+                let off = read_entry_array_item(&mut file, cur, i, compact).unwrap_or(0);
+                if off == 0 {
+                    break;
+                }
+                main_entry_set.insert(off);
+                last = off;
+                total_seen += 1;
+            }
+            let next = read_u64_at(&mut file, cur + 16).unwrap_or(0);
+            if next == 0 || next <= cur {
+                break;
+            }
+            cur = next;
+        }
+        last
+    };
+
+    // 1. Verify data hash table chains (also validates per-data entry references: V-01)
+    verify_data_hash_table(
+        &mut file,
+        data_ht_offset,
+        data_ht_size,
+        &data_offsets,
+        n_data,
+        &main_entry_set,
+        &entry_array_offsets,
+        compact,
+    )?;
 
     // 2. Verify each entry's data items exist and are reachable from hash table
+    //    V-02: Also verify reverse links (data->entry) with last-entry exemption
+
     let mut p2 = header_size;
     if tail_object_offset > 0 {
         loop {
@@ -1458,15 +1664,24 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
             let obj_size2 = read_u64_at(&mut file, p2 + 8)?;
 
             if obj_type_byte2 == ObjectType::Entry as u8 {
-                verify_entry(
-                    &mut file,
-                    p2,
-                    obj_size2,
-                    compact,
-                    &data_offsets,
-                    data_ht_offset,
-                    data_ht_size,
-                )?;
+                // Only verify entries that appear in the main entry array.
+                // systemd: verify_entry called only from verify_entry_array for
+                // entries referenced by the main array (not orphan entry objects).
+                if main_entry_set.contains(&p2) {
+                    // is_last: matches the last entry by position in main array
+                    // (systemd: journal-verify.c:759 `last = i + 1 == n`)
+                    let is_last = last_array_entry != 0 && p2 == last_array_entry;
+                    verify_entry(
+                        &mut file,
+                        p2,
+                        obj_size2,
+                        compact,
+                        &data_offsets,
+                        data_ht_offset,
+                        data_ht_size,
+                        is_last,
+                    )?;
+                }
             }
 
             if p2 == tail_object_offset {
@@ -1486,11 +1701,9 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         entry_array_off,
         compact,
         &entry_offsets,
+        &entry_array_offsets,
         n_entries,
     )?;
-
-    // 4. Verify per-data entry array chains
-    verify_data(&mut file, &data_offsets, &entry_offsets, compact)?;
 
     Ok(VerifyResult {
         n_objects,
@@ -1506,7 +1719,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         } else {
             min_entry_realtime
         },
-        last_entry_realtime: max_entry_realtime,
+        last_entry_realtime,
         warnings,
     })
 }
