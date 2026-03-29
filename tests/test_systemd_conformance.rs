@@ -179,6 +179,42 @@ fn walk_objects(f: &mut File) -> Vec<RawObject> {
     objects
 }
 
+/// Compute the DATA object payload offset, accounting for compact mode.
+/// In compact mode, there are 8 extra bytes (tail_entry_array_offset + n_entries le32 fields).
+fn data_payload_offset(incompatible_flags: u32) -> u64 {
+    if incompatible_flags & incompat::COMPACT != 0 {
+        DATA_OBJECT_HEADER_SIZE as u64 + 8
+    } else {
+        DATA_OBJECT_HEADER_SIZE as u64
+    }
+}
+
+/// Compute the ENTRY item size, accounting for compact mode.
+/// Regular: 16 bytes (object_offset le64 + hash le64). Compact: 4 bytes (object_offset le32).
+fn entry_item_size(incompatible_flags: u32) -> u64 {
+    if incompatible_flags & incompat::COMPACT != 0 {
+        4
+    } else {
+        ENTRY_ITEM_SIZE as u64
+    }
+}
+
+/// Compute the ENTRY_ARRAY item size, accounting for compact mode.
+fn entry_array_item_size(incompatible_flags: u32) -> u64 {
+    if incompatible_flags & incompat::COMPACT != 0 {
+        4
+    } else {
+        8
+    }
+}
+
+/// Read a DATA object's payload (field=value) from the file, accounting for compact mode.
+fn read_data_payload(f: &mut File, obj: &RawObject, incompatible_flags: u32) -> Vec<u8> {
+    let poff = data_payload_offset(incompatible_flags);
+    let payload_len = obj.size - poff;
+    read_bytes(f, obj.offset + poff, payload_len as usize)
+}
+
 /// Write a simple journal with a few entries and return the path wrapper.
 fn write_basic_journal(prefix: &str, n: usize) -> TmpFile {
     let tf = TmpFile::new(prefix);
@@ -368,15 +404,14 @@ fn data_objects_have_valid_structure() {
     let data_objects: Vec<_> = objects.iter().filter(|o| o.obj_type == 1).collect();
     assert!(!data_objects.is_empty(), "should have DATA objects");
 
+    let hdr = read_raw_header(&mut f);
     for obj in &data_objects {
         // hash at offset +16
         let hash = read_u64_at(&mut f, obj.offset + 16);
         assert_ne!(hash, 0, "DATA object at {} has zero hash", obj.offset);
 
-        // payload starts at DATA_OBJECT_HEADER_SIZE (64)
-        let payload_len = obj.size - DATA_OBJECT_HEADER_SIZE as u64;
-        if payload_len > 0 {
-            let payload = read_bytes(&mut f, obj.offset + DATA_OBJECT_HEADER_SIZE as u64, payload_len as usize);
+        let payload = read_data_payload(&mut f, obj, hdr.incompatible_flags);
+        if !payload.is_empty() {
             assert!(
                 payload.contains(&b'='),
                 "DATA object at {} payload does not contain '=' separator",
@@ -407,12 +442,18 @@ fn entry_objects_have_valid_structure() {
         let boot_id = read_u128_at(&mut f, obj.offset + 40);
         assert_ne!(boot_id, [0u8; 16], "ENTRY at {} has null boot_id", obj.offset);
 
-        // Items start at ENTRY_OBJECT_HEADER_SIZE (64), each is 16 bytes (EntryItem)
-        let n_items = (obj.size - ENTRY_OBJECT_HEADER_SIZE as u64) / ENTRY_ITEM_SIZE as u64;
+        // Items start at ENTRY_OBJECT_HEADER_SIZE (64)
+        let hdr = read_raw_header(&mut f);
+        let eitem = entry_item_size(hdr.incompatible_flags);
+        let n_items = (obj.size - ENTRY_OBJECT_HEADER_SIZE as u64) / eitem;
         let mut prev_offset = 0u64;
         for i in 0..n_items {
-            let item_off = obj.offset + ENTRY_OBJECT_HEADER_SIZE as u64 + i * ENTRY_ITEM_SIZE as u64;
-            let data_offset = read_u64_at(&mut f, item_off);
+            let item_off = obj.offset + ENTRY_OBJECT_HEADER_SIZE as u64 + i * eitem;
+            let data_offset = if eitem == 4 {
+                read_u32_at(&mut f, item_off) as u64
+            } else {
+                read_u64_at(&mut f, item_off)
+            };
             assert!(
                 data_offset >= prev_offset,
                 "ENTRY at {} items not sorted by offset: item {} offset {} < prev {}",
@@ -437,11 +478,17 @@ fn entry_array_objects_have_valid_offsets() {
     // There should be at least one entry array (the global one)
     assert!(!ea_objects.is_empty(), "should have ENTRY_ARRAY objects");
 
+    let hdr = read_raw_header(&mut f);
+    let ea_item = entry_array_item_size(hdr.incompatible_flags);
     for obj in &ea_objects {
-        let n_items = (obj.size - ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64) / 8; // 8 bytes per le64
+        let n_items = (obj.size - ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64) / ea_item;
         for i in 0..n_items {
-            let item_off = obj.offset + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + i * 8;
-            let entry_offset = read_u64_at(&mut f, item_off);
+            let item_off = obj.offset + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + i * ea_item;
+            let entry_offset = if ea_item == 4 {
+                read_u32_at(&mut f, item_off) as u64
+            } else {
+                read_u64_at(&mut f, item_off)
+            };
             if entry_offset == 0 {
                 // Trailing zeros are allowed (unfilled slots)
                 continue;
@@ -554,14 +601,17 @@ fn global_entry_array_matches_n_entries() {
         let obj_type = read_u8_at(&mut f, current_ea);
         assert_eq!(obj_type, 6, "global entry array chain should only contain ENTRY_ARRAY objects");
 
+        let ea_item = entry_array_item_size(hdr.incompatible_flags);
         let obj_size = read_u64_at(&mut f, current_ea + 8);
-        let n_items = (obj_size - ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64) / 8;
+        let n_items = (obj_size - ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64) / ea_item;
 
         for i in 0..n_items {
-            let entry_off = read_u64_at(
-                &mut f,
-                current_ea + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + i * 8,
-            );
+            let item_off = current_ea + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + i * ea_item;
+            let entry_off = if ea_item == 4 {
+                read_u32_at(&mut f, item_off) as u64
+            } else {
+                read_u64_at(&mut f, item_off)
+            };
             if entry_off == 0 {
                 // Unfilled trailing slot
                 break;
@@ -606,9 +656,10 @@ fn entry_array_chain_uses_exponential_growth() {
     let mut current_ea = hdr.entry_array_offset;
     let mut sizes = Vec::new();
 
+    let ea_item = entry_array_item_size(hdr.incompatible_flags);
     while current_ea != 0 {
         let obj_size = read_u64_at(&mut f, current_ea + 8);
-        let n_items = (obj_size - ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64) / 8;
+        let n_items = (obj_size - ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64) / ea_item;
         sizes.push(n_items);
         current_ea = read_u64_at(&mut f, current_ea + 16);
     }
@@ -758,18 +809,16 @@ fn duplicate_field_values_produce_single_data_object() {
     }
 
     let mut f = File::open(tf.path()).unwrap();
+    let hdr = read_raw_header(&mut f);
     let objects = walk_objects(&mut f);
 
     // Count DATA objects whose payload is "MESSAGE=same-value"
     let target = b"MESSAGE=same-value";
     let mut count = 0;
     for obj in objects.iter().filter(|o| o.obj_type == 1) {
-        let payload_len = obj.size - DATA_OBJECT_HEADER_SIZE as u64;
-        if payload_len == target.len() as u64 {
-            let payload = read_bytes(&mut f, obj.offset + DATA_OBJECT_HEADER_SIZE as u64, payload_len as usize);
-            if payload == target {
-                count += 1;
-            }
+        let payload = read_data_payload(&mut f, obj, hdr.incompatible_flags);
+        if payload == target {
+            count += 1;
         }
     }
     assert_eq!(
@@ -800,10 +849,10 @@ fn every_data_object_has_corresponding_field_object() {
         field_names.insert(payload);
     }
 
+    let hdr = read_raw_header(&mut f);
     // For each DATA object, extract the field name and check it exists
     for obj in objects.iter().filter(|o| o.obj_type == 1) {
-        let payload_len = obj.size - DATA_OBJECT_HEADER_SIZE as u64;
-        let payload = read_bytes(&mut f, obj.offset + DATA_OBJECT_HEADER_SIZE as u64, payload_len as usize);
+        let payload = read_data_payload(&mut f, obj, hdr.incompatible_flags);
         // Field name is everything before the first '='
         if let Some(eq_pos) = payload.iter().position(|&b| b == b'=') {
             let field_name = &payload[..eq_pos];
@@ -838,6 +887,7 @@ fn per_data_entry_arrays_are_correct() {
     }
 
     let mut f = File::open(tf.path()).unwrap();
+    let hdr = read_raw_header(&mut f);
     let objects = walk_objects(&mut f);
 
     // Find the DATA objects for MESSAGE=alpha and MESSAGE=beta
@@ -848,8 +898,7 @@ fn per_data_entry_arrays_are_correct() {
             .iter()
             .filter(|o| o.obj_type == 1)
             .find(|o| {
-                let plen = o.size - DATA_OBJECT_HEADER_SIZE as u64;
-                let p = read_bytes(&mut f, o.offset + DATA_OBJECT_HEADER_SIZE as u64, plen as usize);
+                let p = read_data_payload(&mut f, o, hdr.incompatible_flags);
                 p == *target_payload
             })
             .unwrap_or_else(|| panic!("DATA object for {:?} not found", String::from_utf8_lossy(target_payload)));
@@ -871,15 +920,18 @@ fn per_data_entry_arrays_are_correct() {
         }
 
         let ea_offset = read_u64_at(&mut f, data_obj.offset + 48); // entry_array_offset
+        let ea_item = entry_array_item_size(hdr.incompatible_flags);
         let mut current_ea = ea_offset;
         while current_ea != 0 {
             let ea_size = read_u64_at(&mut f, current_ea + 8);
-            let n_items = (ea_size - ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64) / 8;
+            let n_items = (ea_size - ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64) / ea_item;
             for i in 0..n_items {
-                let eo = read_u64_at(
-                    &mut f,
-                    current_ea + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + i * 8,
-                );
+                let item_off = current_ea + ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64 + i * ea_item;
+                let eo = if ea_item == 4 {
+                    read_u32_at(&mut f, item_off) as u64
+                } else {
+                    read_u64_at(&mut f, item_off)
+                };
                 if eo == 0 {
                     break;
                 }
@@ -930,13 +982,19 @@ fn xor_hash_matches_recomputed_value() {
     for entry_obj in &entry_objects {
         let stored_xor_hash = read_u64_at(&mut f, entry_obj.offset + 56);
 
+        let eitem_size = entry_item_size(hdr.incompatible_flags);
         let n_items =
-            (entry_obj.size - ENTRY_OBJECT_HEADER_SIZE as u64) / ENTRY_ITEM_SIZE as u64;
+            (entry_obj.size - ENTRY_OBJECT_HEADER_SIZE as u64) / eitem_size;
         let mut computed_xor: u64 = 0;
+        let poff = data_payload_offset(hdr.incompatible_flags);
         for i in 0..n_items {
             let item_off =
-                entry_obj.offset + ENTRY_OBJECT_HEADER_SIZE as u64 + i * ENTRY_ITEM_SIZE as u64;
-            let data_offset = read_u64_at(&mut f, item_off);
+                entry_obj.offset + ENTRY_OBJECT_HEADER_SIZE as u64 + i * eitem_size;
+            let data_offset = if eitem_size == 4 {
+                read_u32_at(&mut f, item_off) as u64
+            } else {
+                read_u64_at(&mut f, item_off)
+            };
 
             if keyed_hash {
                 // Read the DATA object's payload and compute jenkins_hash64
@@ -948,10 +1006,10 @@ fn xor_hash_matches_recomputed_value() {
                     // and the xor_hash was computed from the uncompressed payload
                     continue;
                 }
-                let payload_len = data_obj_size - DATA_OBJECT_HEADER_SIZE as u64;
+                let payload_len = data_obj_size - poff;
                 let payload = read_bytes(
                     &mut f,
-                    data_offset + DATA_OBJECT_HEADER_SIZE as u64,
+                    data_offset + poff,
                     payload_len as usize,
                 );
                 computed_xor ^= hash64(&payload);
@@ -1163,11 +1221,12 @@ fn large_file_all_entries_readable() {
     // Verify entry array growth is exponential via binary inspection
     let mut f = File::open(tf.path()).unwrap();
     let hdr = read_raw_header(&mut f);
+    let ea_item = entry_array_item_size(hdr.incompatible_flags);
     let mut current_ea = hdr.entry_array_offset;
     let mut sizes = Vec::new();
     while current_ea != 0 {
         let obj_size = read_u64_at(&mut f, current_ea + 8);
-        let n_items = (obj_size - ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64) / 8;
+        let n_items = (obj_size - ENTRY_ARRAY_OBJECT_HEADER_SIZE as u64) / ea_item;
         sizes.push(n_items);
         current_ea = read_u64_at(&mut f, current_ea + 16);
     }
@@ -1494,8 +1553,7 @@ fn data_object_hash_matches_keyed_siphash() {
 
     for obj in objects.iter().filter(|o| o.obj_type == 1) {
         let stored_hash = read_u64_at(&mut f, obj.offset + 16);
-        let payload_len = obj.size - DATA_OBJECT_HEADER_SIZE as u64;
-        let payload = read_bytes(&mut f, obj.offset + DATA_OBJECT_HEADER_SIZE as u64, payload_len as usize);
+        let payload = read_data_payload(&mut f, obj, hdr.incompatible_flags);
 
         let mut hasher = SipHasher24::new_with_keys(k0, k1);
         hasher.write(&payload);

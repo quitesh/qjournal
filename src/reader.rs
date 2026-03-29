@@ -45,6 +45,23 @@ const TEST_RIGHT: i32 = 2;
 const TEST_GOTO_NEXT: i32 = 3;
 const TEST_GOTO_PREVIOUS: i32 = 4;
 
+// ── Location type ────────────────────────────────────────────────────────
+// systemd: journal-file.h:30-42
+
+/// Current seek position within a journal file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationType {
+    /// The first entry (head of file).
+    Head,
+    /// The last entry (tail of file).
+    Tail,
+    /// Already read the entry at the current position; the next call should
+    /// advance past it.
+    Discrete,
+    /// Seek to the precise location; it has not been read yet.
+    Seek,
+}
+
 // ── Chain cache ──────────────────────────────────────────────────────────
 // systemd: journal-file.c:2662-2710
 
@@ -113,12 +130,27 @@ pub struct JournalReader {
     /// Byte offset of the data hash table items (past ObjectHeader).
     data_ht_items: u64,
     data_ht_n: u64,
+    /// Byte offset of the field hash table items (past ObjectHeader).
+    field_ht_items: u64,
+    field_ht_n: u64,
     /// Offset of the root entry-array object, or 0.
     entry_array_offset: u64,
     n_entries: u64,
     /// Chain cache for bisection acceleration.
     /// systemd: journal-file.c:2662 (ordered_hashmap keyed by chain first offset)
     chain_cache: IndexMap<u64, ChainCacheItem>,
+    /// Current location state.
+    /// systemd: journal-file.h:66
+    location_type: LocationType,
+    /// systemd: journal-file.h:65
+    last_direction: Option<Direction>,
+    /// systemd: journal-file.h:77-82
+    current_offset: u64,
+    current_seqnum: u64,
+    current_realtime: u64,
+    current_monotonic: u64,
+    current_boot_id: [u8; 16],
+    current_xor_hash: u64,
 }
 
 impl JournalReader {
@@ -148,6 +180,10 @@ impl JournalReader {
         let data_ht_size = from_le64(&h.data_hash_table_size);
         let data_ht_n = data_ht_size / HASH_ITEM_SIZE as u64;
 
+        let field_ht_items = from_le64(&h.field_hash_table_offset);
+        let field_ht_size = from_le64(&h.field_hash_table_size);
+        let field_ht_n = field_ht_size / HASH_ITEM_SIZE as u64;
+
         Ok(Self {
             file,
             mmap,
@@ -155,9 +191,19 @@ impl JournalReader {
             compact,
             data_ht_items,
             data_ht_n,
+            field_ht_items,
+            field_ht_n,
             entry_array_offset: from_le64(&h.entry_array_offset),
             n_entries: from_le64(&h.n_entries),
             chain_cache: IndexMap::new(),
+            location_type: LocationType::Head,
+            last_direction: None,
+            current_offset: 0,
+            current_seqnum: 0,
+            current_realtime: 0,
+            current_monotonic: 0,
+            current_boot_id: [0u8; 16],
+            current_xor_hash: 0,
             header: h,
         })
     }
@@ -397,6 +443,70 @@ impl JournalReader {
     pub fn find_data_object(&mut self, data: &[u8]) -> Result<Option<u64>> {
         let hash = journal_file_hash_data(data, self.keyed_hash, &self.header.file_id);
         self.find_data_object_with_hash(data, hash)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Field object lookup
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:1520-1583 journal_file_find_field_object_with_hash
+    ///
+    /// Walk the field hash chain for `hash`, compare payloads,
+    /// return the offset of the matching FIELD object.
+    pub fn find_field_object_with_hash(
+        &mut self,
+        field: &[u8],
+        hash: u64,
+    ) -> Result<Option<u64>> {
+        if field.is_empty() {
+            return Ok(None);
+        }
+        if self.field_ht_n == 0 {
+            return Ok(None);
+        }
+
+        let expected_obj_size = FIELD_OBJECT_HEADER_SIZE as u64 + field.len() as u64;
+
+        let h = hash % self.field_ht_n;
+        let item_off = self.field_ht_items + h * HASH_ITEM_SIZE as u64;
+        // Read head_hash_offset from the hash table bucket
+        let mut p = self.read_u64_at(item_off)?;
+
+        #[allow(unused_assignments)]
+        let mut prev = 0u64;
+
+        while p > 0 {
+            let (_, obj_size) = self.move_to_object(ObjectType::Field, p)?;
+
+            let stored_hash = self.read_u64_at(p + 16)?; // field.hash
+            if stored_hash == hash
+                && obj_size == expected_obj_size
+            {
+                // Compare payload
+                let payload = self.read_bytes_at(
+                    p + FIELD_OBJECT_HEADER_SIZE as u64,
+                    field.len(),
+                )?;
+                if payload == field {
+                    return Ok(Some(p));
+                }
+            }
+
+            // Advance to next in chain with loop detection
+            prev = p;
+            p = self.read_u64_at(p + 24)?; // field.next_hash_offset
+            if p > 0 && p <= prev {
+                return Err(Error::InvalidFile("field hash chain loop detected".into()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// systemd: journal-file.c:1603-1619 journal_file_find_field_object
+    pub fn find_field_object(&mut self, field: &[u8]) -> Result<Option<u64>> {
+        let hash = journal_file_hash_data(field, self.keyed_hash, &self.header.file_id);
+        self.find_field_object_with_hash(field, hash)
     }
 
     /// Read the raw payload of a DATA object, handling compact mode and decompression.
@@ -845,6 +955,11 @@ impl JournalReader {
         left: &mut u64,
         right: &mut u64,
     ) -> Result<i32> {
+        // Match systemd's entry assertions (journal-file.c generic_array_bisect_step).
+        debug_assert!(*left <= i, "bisect_step: left ({}) > i ({})", *left, i);
+        debug_assert!(i <= *right, "bisect_step: i ({}) > right ({})", i, *right);
+        debug_assert!(*right < *m, "bisect_step: right ({}) >= m ({})", *right, *m);
+
         let p = self.entry_array_item(arr_offset, i)?;
         let r = if p == 0 {
             Err(Error::CorruptObject {
@@ -859,6 +974,8 @@ impl JournalReader {
             Err(ref e) if Self::is_corruption_error(e) => {
                 // systemd: IN_SET(r, -EBADMSG, -EADDRNOTAVAIL) — corruption only
                 if i == *left {
+                    // systemd: journal-file.c:2955
+                    debug_assert!(i == 0 || (*right - *left <= 1 && direction == Direction::Down));
                     return Ok(TEST_GOTO_PREVIOUS);
                 }
                 *m = i;
@@ -1021,6 +1138,9 @@ impl JournalReader {
                             if r == TEST_GOTO_PREVIOUS || r == TEST_GOTO_NEXT {
                                 return Ok(None);
                             }
+                            // systemd: journal-file.c:3139-3140
+                            debug_assert!(r == TEST_RIGHT);
+                            debug_assert!(left == right);
                         }
                         // Found
                         return self.bisect_found(a, first, left, t);
@@ -1039,6 +1159,9 @@ impl JournalReader {
                     }
                 }
             }
+
+            // systemd: journal-file.c:3161
+            debug_assert!(r == (if direction == Direction::Down { TEST_GOTO_NEXT } else { TEST_LEFT }));
 
             // Not in this array, go to next
             if k >= n {
@@ -1611,6 +1734,60 @@ impl JournalReader {
     /// Return a reference to the file header.
     pub fn header(&self) -> &Header {
         &self.header
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Location tracking
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// systemd: journal-file.c:3495-3509 journal_file_reset_location
+    ///
+    /// Reset the current seek position to HEAD.  Also clears `last_direction`
+    /// so that `next_beyond_location` does not wrongly assume we already hit
+    /// EOF (see systemd issue #29216).
+    pub fn reset_location(&mut self) {
+        self.location_type = LocationType::Head;
+        self.current_offset = 0;
+        self.current_seqnum = 0;
+        self.current_realtime = 0;
+        self.current_monotonic = 0;
+        self.current_boot_id = [0u8; 16];
+        self.current_xor_hash = 0;
+        self.last_direction = None;
+    }
+
+    /// systemd: journal-file.c:3511-3522 journal_file_save_location
+    ///
+    /// Save the position of entry at `offset` so that subsequent navigation
+    /// calls can use it.
+    pub fn save_location(&mut self, offset: u64) -> Result<()> {
+        let (_, _) = self.move_to_object(ObjectType::Entry, offset)?;
+
+        self.location_type = LocationType::Seek;
+        self.current_offset = offset;
+        self.current_seqnum = self.read_u64_at(offset + 16)?;
+        self.current_realtime = self.read_u64_at(offset + 24)?;
+        self.current_monotonic = self.read_u64_at(offset + 32)?;
+        let boot_bytes = self.read_bytes_at(offset + 40, 16)?;
+        self.current_boot_id.copy_from_slice(&boot_bytes);
+        self.current_xor_hash = self.read_u64_at(offset + 56)?;
+
+        Ok(())
+    }
+
+    /// Return the current location type.
+    pub fn location_type(&self) -> LocationType {
+        self.location_type
+    }
+
+    /// Return the last traversal direction, if any.
+    pub fn last_direction(&self) -> Option<Direction> {
+        self.last_direction
+    }
+
+    /// Return the current entry offset (0 if no location saved).
+    pub fn current_offset(&self) -> u64 {
+        self.current_offset
     }
 }
 

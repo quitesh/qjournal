@@ -94,6 +94,11 @@ pub fn journal_file_hmac_setup() -> JournalHmac {
 ///
 /// Matches `journal_file_hmac_start()`.
 pub fn journal_file_hmac_start(state: &mut JournalHmac, fsprg_state: &[u8]) {
+    // Match systemd: no-op if HMAC cycle is already running.
+    if state.running {
+        return;
+    }
+
     let key = fsprg::get_key(fsprg_state, 32, 0); // 256 / 8 — same as systemd
 
     state.hmac = Some(
@@ -176,13 +181,40 @@ pub fn journal_file_hmac_put_object(
         return Err("object too small for ObjectHeader");
     }
 
+    // Validate that the object's embedded type matches the passed type,
+    // matching systemd's assertion in journal_file_hmac_put_object().
+    // When obj_type is Unused (0), skip validation (pass-through any type),
+    // matching systemd's "type > OBJECT_UNUSED" guard.
+    let embedded_type = obj_data[0];
+    if obj_type != ObjectType::Unused && embedded_type != obj_type as u8 {
+        return Err("object type mismatch in HMAC put");
+    }
+
     // ObjectHeader fields up to (but not including) payload — that is the
     // full 16-byte ObjectHeader (type, flags, reserved, size).
     hmac.update(&obj_data[..OBJECT_HEADER_SIZE]);
 
     let obj_size = obj_data.len();
 
-    match obj_type {
+    // When obj_type is Unused, it means "accept any embedded type" — dispatch
+    // on the embedded type byte instead. Matches systemd's behavior where
+    // type > OBJECT_UNUSED skips validation, then switches on o->object.type.
+    let dispatch_type = if obj_type == ObjectType::Unused {
+        match embedded_type {
+            1 => ObjectType::Data,
+            2 => ObjectType::Field,
+            3 => ObjectType::Entry,
+            4 => ObjectType::DataHashTable,
+            5 => ObjectType::FieldHashTable,
+            6 => ObjectType::EntryArray,
+            7 => ObjectType::Tag,
+            _ => return Err("unknown or unused embedded object type"),
+        }
+    } else {
+        obj_type
+    };
+
+    match dispatch_type {
         ObjectType::Data => {
             // Feed: hash (8 bytes at offset 16) then payload.
             // Skip: next_hash_offset, next_field_offset, entry_offset,
@@ -237,7 +269,8 @@ pub fn journal_file_hmac_put_object(
         }
 
         ObjectType::Unused => {
-            return Err("cannot HMAC an UNUSED object");
+            // Unreachable: handled by dispatch_type resolution above.
+            unreachable!("Unused dispatch handled above");
         }
     }
 
@@ -464,6 +497,103 @@ pub fn journal_file_get_epoch(
         return Err("realtime before FSS start");
     }
     Ok((realtime - start_usec) / interval_usec)
+}
+
+// ── FSPRG evolve / seek / maybe_append_tag ───────────────────────────────
+
+/// Evolve the FSPRG state forward one or more epochs, emitting a tag at
+/// each intermediate epoch.
+///
+/// Matches `journal_file_fsprg_evolve()` (journal-authenticate.c:166-200).
+///
+/// `goal_epoch` is the target epoch. The state is evolved from its current
+/// epoch to `goal_epoch`. Tags are emitted AFTER evolving, only for
+/// intermediate epochs (not the initial or final epoch). The HMAC key used
+/// for each tag is derived from the post-evolve state.
+///
+/// The callback receives the current FSPRG state (for HMAC key derivation)
+/// and the epoch number that was just reached.
+pub fn journal_file_fsprg_evolve<F>(
+    fss: &mut FssState,
+    goal_epoch: u64,
+    mut tag_cb: F,
+) -> Result<(), &'static str>
+where
+    F: FnMut(&[u8], u64) -> Result<(), &'static str>,
+{
+    loop {
+        let epoch = fsprg::get_epoch(&fss.fsprg_state);
+
+        if epoch > goal_epoch {
+            return Err("FSPRG epoch ahead of goal (stale)");
+        }
+        if epoch == goal_epoch {
+            return Ok(());
+        }
+
+        // Evolve first, then tag if we haven't reached the goal yet.
+        fsprg::evolve(&mut fss.fsprg_state);
+
+        let new_epoch = fsprg::get_epoch(&fss.fsprg_state);
+        if new_epoch < goal_epoch {
+            // Intermediate epoch — emit a tag using the post-evolve state.
+            tag_cb(&fss.fsprg_state, new_epoch)?;
+        }
+    }
+}
+
+/// Seek the FSPRG state to an arbitrary epoch using the seed.
+///
+/// Matches `journal_file_fsprg_seek()` (journal-authenticate.c:202-239).
+///
+/// If `goal` is the current epoch or the next epoch, an optimized path
+/// avoids the expensive full reseed.
+pub fn journal_file_fsprg_seek(
+    fss: &mut FssState,
+    goal: u64,
+    seed: &[u8],
+) {
+    let current = fsprg::get_epoch(&fss.fsprg_state);
+
+    // Optimization: current epoch — no-op.
+    if goal == current {
+        return;
+    }
+
+    // Optimization: next epoch — just evolve once.
+    if goal == current + 1 {
+        fsprg::evolve(&mut fss.fsprg_state);
+        return;
+    }
+
+    // Full reseed: regenerate master key pair and seek.
+    let secpar = u16::from_le_bytes(fss.header.fsprg_secpar) as u32;
+    let (msk, _mpk) = fsprg::gen_mk(Some(seed), secpar);
+    fsprg::seek(&mut fss.fsprg_state, goal, &msk, seed);
+}
+
+/// Check whether a new tag should be emitted and evolve the FSPRG key
+/// if needed.
+///
+/// Matches `journal_file_maybe_append_tag()` (journal-authenticate.c:241-265).
+///
+/// Returns `true` if the epoch changed (and the caller should write a tag
+/// for the old epoch). The caller is responsible for actually emitting the
+/// tag.
+pub fn journal_file_maybe_append_tag(
+    fss: &FssState,
+    realtime: u64,
+) -> Result<Option<u64>, &'static str> {
+    let goal = journal_file_get_epoch(fss.start_usec, fss.interval_usec, realtime)?;
+    let current = fsprg::get_epoch(&fss.fsprg_state);
+
+    if goal <= current {
+        // Still in the same epoch — no tag needed.
+        return Ok(None);
+    }
+
+    // Epoch has advanced — caller must emit a tag for `current` and evolve.
+    Ok(Some(current))
 }
 
 // ── Header offset helpers ────────────────────────────────────────────────
