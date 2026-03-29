@@ -1,8 +1,8 @@
 # qjournal vs systemd Audit: Divergence Report
 
-Three-round audit of qjournal against systemd's journal implementation.
-Round 1 used training-data knowledge; Rounds 2-3 used actual systemd source files
-from `.systemd-ref/`.
+Seven-round audit of qjournal against systemd's journal implementation.
+Rounds 1–3 used training-data knowledge; Rounds 4–14 used actual systemd source
+files from `.systemd-ref/`.
 
 ## Fixed in this PR
 
@@ -24,11 +24,15 @@ from `.systemd-ref/`.
 - **Dispose random** (LOW, R1): 64-bit random in filename
 - **Monotonic guard** (LOW, R2): Removed extra `!= 0` guard
 - **Dead strict_order block** (HIGH, R3): Removed misleading no-op code
+- **Compression offset** (HIGH, R4): After compression, `self.offset` now advances by `ALIGN64(compressed_size)`
 
 ### reader.rs
 - **find_field_object** (HIGH, R1): Implemented field hash table lookup
 - **Location tracking** (HIGH, R1): Added LocationType, reset/save_location
 - **Debug assertions** (MEDIUM, R1+R2+R3): Entry invariants in bisect_step
+- **entries_for_field seen counter** (MEDIUM, R7): All slots count toward n_entries cap
+- **BISECT_FOUND_UNCONDITIONAL_ENTRY_VALIDATION** (MEDIUM, R8): Removed unconditional `move_to_object` from `bisect_found`; systemd only validates when `ret_object != NULL`
+- **R-NEW-1** (MEDIUM, R9): Removed unconditional `move_to_object` on `extra` in `generic_array_bisect_for_data`; systemd only validates when `ret_object != NULL`
 
 ### verify.rs
 - **Bidirectional entry<->data check** (CRITICAL, R1): verify_data_hash_table now validates
@@ -41,6 +45,19 @@ from `.systemd-ref/`.
 - **tail_entry_realtime** (MEDIUM, R1+R2): Uses last entry (not max)
 - **Hash chain depth limit** (MEDIUM, R1): Added 1M cap
 - **Header-version-aware counts** (MEDIUM, R1): Conditional on header_size
+- **Zero-item ENTRY_ARRAY rejection** (MEDIUM, R4): Added (systemd rejects `n_items <= 0`)
+- **DATA-ENTRY-ARRAY-FIRSTPASS** (MEDIUM, R7): Removed n_entries/entry_array_offset consistency check from first pass (belongs only in second pass)
+- **VERIFY-ENTRY-SCOPE** (HIGH, R7): verify_entry now only called for entries in main entry array (not orphans), matching systemd's verify_entry_array architecture
+- **IS-LAST-ENTRY-DETERMINATION** (HIGH, R7): Main entry array scan bounded by n_entries; last entry determined from the first n_entries slots only
+- **EPOCH-CONTINUOUS-1** (MEDIUM, R7): SEALED_CONTINUOUS epoch check now strict for 3rd+ tags (must advance by exactly 1)
+- **SEALED-ENTRY-BEFORE-TAG** (MEDIUM, R8): Entries before first TAG in sealed journals now rejected, matching systemd journal-verify.c:1259
+- **ENTRY-ARRAY-ITEM-MONOTONIC-FIRST-PASS** (LOW, R8): Removed extra monotonicity check from first-pass EntryArray; systemd only checks monotonicity in second pass for referenced arrays
+- **VERIFY-DATA-ENTRY-NOT-IN-MAIN-ARRAY** (HIGH, R8): verify_data_object now validates that data-linked entries are in main_entry_set (not just any ENTRY object)
+- **BUG-VERIFY-01** (HIGH, R9): Removed false `'='` check on FIELD payloads; systemd does not check this during verification
+- **BUG-VERIFY-02** (LOW, R9): Added `entry_array_offsets` validation in verify_data_object; systemd's `contains_uint64(cache_entry_array_fd, ...)` check
+- **VERIFY-ORPHAN-DATA** (MEDIUM, R10): Removed `total_data_count != n_data` check; systemd tolerates orphaned DATA objects not linked into any hash chain
+- **VERIFY-EA-ITEM-BREAK-ON-ZERO** (LOW, R11): Changed `break` to `continue` on zero slots in EntryArray first-pass; systemd iterates all slots checking each non-zero item
+- **BUG-VERIFY-EA-CHAIN-MEMBERSHIP** (MEDIUM, R12): validate entry array chain offsets in verify_entry_array against pass-1 set; systemd's `contains_uint64(cache_entry_array_fd, ...)` check
 
 ### fss.rs
 - **hmac_start no-op** (MEDIUM, R1): Returns early if already running
@@ -103,13 +120,6 @@ low for non-daemon use.
 | D4 | MEDIUM | tail_entry_seqnum updated late (after entry write, not before) |
 | D9 | LOW | Incomplete seqnum_id reconciliation for multi-source writes |
 
-**Fixed in Round 4**: Compression offset bug — after compression, `self.offset` now
-advances by `ALIGN64(compressed_size)` matching systemd's `journal_file_tail_end_by_mmap`
-which uses `tail_object_offset + ALIGN64(object.size)` to find the next object position.
-Previously, qjournal advanced by the uncompressed size, leaving a gap that caused
-sequential object scanners (`journalctl --verify`) to land in zero-padding and report
-corruption.
-
 **Rationale**: D1 causes seqnum gaps when entries are rejected by strict_order.
 This is a real bug but only affects the case where timestamps go backwards (rare
 in practice). D3 means allocation failures abort per-data linking instead of
@@ -131,17 +141,10 @@ requires re-reading n_entries from the mmap'd header on each call.
 | ID | Severity | Issue |
 |----|----------|-------|
 | D01 | CRITICAL | No tag verification (seqnum, epoch, HMAC) for sealed journals |
-| D03 | HIGH | Per-data entries verified against HashSet, not main entry array |
 | D06 | MEDIUM | No SEALED_CONTINUOUS warning |
 
-**Fixed in Round 4**: Zero-item ENTRY_ARRAY rejection — systemd's `journal_file_object_verify`
-rejects entry array objects with 0 items (`n_items <= 0`). qjournal now enforces the same
-check alongside the existing size modulo check.
-
 **Rationale**: D01 requires FSPRG/HMAC crypto integration which is not yet
-complete. When FSS support matures, tag verification should be added. D03 uses
-a HashSet of known entries instead of walking the main entry array — this catches
-most corruption but misses orphaned entries not in the main array.
+complete. When FSS support matures, tag verification should be added.
 
 ### fss.rs — Remaining items
 
