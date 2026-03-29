@@ -923,6 +923,7 @@ fn verify_entry_array(
     entry_array_offset: u64,
     compact: bool,
     entry_offsets: &HashSet<u64>,
+    entry_array_offsets: &HashSet<u64>,
     n_entries: u64,
 ) -> Result<()> {
     if entry_array_offset == 0 {
@@ -941,6 +942,15 @@ fn verify_entry_array(
     let mut prev_entry_off = 0u64;
 
     while cur_array != 0 {
+        // systemd: journal-verify.c — contains_uint64(cache_entry_array_fd, n_entry_arrays, a)
+        // Each entry array offset must have been observed during the sequential pass-1 walk.
+        if !entry_array_offsets.contains(&cur_array) {
+            return Err(Error::InvalidFile(format!(
+                "entry array chain references {:#x} which was not seen in pass 1",
+                cur_array
+            )));
+        }
+
         // Verify type byte is EntryArray
         let type_byte = {
             file.seek(SeekFrom::Start(cur_array))?;
@@ -1691,6 +1701,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         entry_array_off,
         compact,
         &entry_offsets,
+        &entry_array_offsets,
         n_entries,
     )?;
 
