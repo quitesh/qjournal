@@ -1,6 +1,6 @@
 [package]
 name = "qjournal"
-version = "0.2.1"
+version = "0.3.1"
 edition = "2021"
 description = "Cross-platform native systemd-journald compatible journal reader/writer"
 license = "LGPL-2.1-or-later"

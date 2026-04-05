@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-04-05
+
+### Fixed
+- Check ZSTD frame content size before decompressing to prevent 4GiB+ decompression bombs.
+- Fix chain-cache update logic: always update existing cache entries even when `array == first`, matching systemd.
+- Guard `bump_array_index` against `n == 0` to prevent underflow.
+- Return error on null offset in `test_object_offset` instead of silently skipping, matching systemd's `-EBADMSG`.
+- Propagate errors in entry-array verification instead of silently treating them as zero.
+
+### Changed
+- Use checked arithmetic in `MmapCache` reads to prevent truncation on 32-bit platforms.
+- Add `Error::FileTooLarge` variant; use it for allocation size-limit errors instead of `Error::InvalidFile`.
+- Simplify `journal_file_append_tag` to delegate to `journal_file_hmac_put_object`, matching systemd's call sequence.
+- Always use `FSPRG_RECOMMENDED_SECPAR` for key generation, ignoring FSS header field, matching systemd.
+- Use `wrapping_mul` for FSS start_usec calculation to match systemd overflow semantics.
+- Update README: document all feature flags, fix C-dependency claims.
+
 ## [0.2.1] - 2026-04-05
 
 ### Fixed
@@ -40,6 +57,7 @@ All notable changes to this project will be documented in this file.
 - Optional forward-secure sealing (FSS) via FSPRG.
 - Cache per-data entry-array tail to avoid O(n^2) linked-list walk.
 
+[0.3.1]: https://github.com/quitesh/qjournal/compare/v0.2.1...v0.3.1
 [0.2.1]: https://github.com/quitesh/qjournal/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/quitesh/qjournal/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/quitesh/qjournal/compare/v0.1.0...v0.1.1
