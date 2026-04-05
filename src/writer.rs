@@ -2059,16 +2059,16 @@ impl JournalWriter {
         }
         let new_end = offset + size;
 
-        // systemd: journal-file.c:794-795 — max_size check
+        // systemd: journal-file.c:794-795 — max_size check (returns -E2BIG)
         if self.metrics.max_size != u64::MAX && new_end > self.metrics.max_size {
-            return Err(Error::InvalidFile(format!(
+            return Err(Error::FileTooLarge(format!(
                 "file would exceed max_size ({} > {})",
                 new_end, self.metrics.max_size
             )));
         }
-        // systemd: journal-file.c:797-799 — compact mode 4GB limit
+        // systemd: journal-file.c:797-799 — compact mode 4GB limit (returns -E2BIG)
         if self.compact && new_end > JOURNAL_COMPACT_SIZE_MAX {
-            return Err(Error::InvalidFile(format!(
+            return Err(Error::FileTooLarge(format!(
                 "compact mode file would exceed 4GB ({} > {})",
                 new_end, JOURNAL_COMPACT_SIZE_MAX
             )));
@@ -3313,23 +3313,19 @@ impl JournalWriter {
         // systemd: journal-file.c:2279-2287
         //   k = journal_file_link_entry_item(f, offset, items[i].object_offset);
         //   if (k == -E2BIG) r = k; else if (k < 0) return k;
-        // DIVERGENCE FIX (3c): was swallowing ALL errors; now only tolerates
-        // allocation failures (which map to io::ErrorKind::Other in our case).
-        // We propagate I/O errors but tolerate array growth failures.
-        let mut link_err = Ok(());
+        // systemd tolerates -E2BIG from link_entry_item (the file hit max_size
+        // during entry-array allocation).  Our equivalent is Error::FileTooLarge,
+        // returned by journal_file_allocate when the file would exceed max_size
+        // or the compact-mode 4 GB limit.
         for &(data_offset, _) in items {
             match self.link_entry_into_data_array(data_offset, entry_offset) {
                 Ok(()) => {}
-                Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::Other => {
-                    link_err = Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "entry array allocation failed (E2BIG equivalent)",
-                    )));
+                Err(Error::FileTooLarge(_)) => {
+                    // Tolerate: file hit size limit, skip this data link.
                 }
                 Err(e) => return Err(e),
             }
         }
-        let _ = link_err; // Record but don't fail on E2BIG-equivalent
 
         self.write_header()?;
 

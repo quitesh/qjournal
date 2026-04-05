@@ -527,6 +527,22 @@ impl JournalReader {
         if compressed & obj_flags::COMPRESSED_ZSTD != 0 {
             #[cfg(feature = "zstd-compression")]
             {
+                // Check decompressed size from the frame header BEFORE allocating/decompressing,
+                // matching systemd's use of ZSTD_getFrameContentSize in decompress_blob_zstd.
+                match zstd::zstd_safe::get_frame_content_size(raw.as_slice()) {
+                    Err(_) => {
+                        return Err(Error::Decompression("ZSTD frame content size error".into()));
+                    }
+                    // None means the frame doesn't declare its size;
+                    // fall through and let decode_all handle it with the post-check.
+                    Ok(None) => {}
+                    Ok(Some(size)) if size > 4 * 1024 * 1024 * 1024 => {
+                        return Err(Error::Decompression(
+                            "ZSTD decompressed size exceeds 4GiB limit".into(),
+                        ));
+                    }
+                    Ok(Some(_)) => {}
+                }
                 let decompressed = zstd::decode_all(raw.as_slice())
                     .map_err(|e| Error::Decompression(e.to_string()))?;
                 if decompressed.len() as u64 > 4 * 1024 * 1024 * 1024 {
@@ -665,13 +681,15 @@ impl JournalReader {
         total: u64,
         last_index: u64,
     ) {
-        // Don't cache if array == first (first array in chain, not worth caching)
-        if array == first {
+        // systemd: only skip caching for array==first when there's no existing
+        // cache entry (ci==NULL). If there IS an existing entry, always update it.
+        let has_existing = self.chain_cache.contains_key(&first);
+        if !has_existing && array == first {
             return;
         }
 
         // Evict oldest (insertion-order FIFO, matching systemd's ordered_hashmap_steal_first)
-        if !self.chain_cache.contains_key(&first) && self.chain_cache.len() >= CHAIN_CACHE_MAX {
+        if !has_existing && self.chain_cache.len() >= CHAIN_CACHE_MAX {
             self.chain_cache.shift_remove_index(0);
         }
 
@@ -693,6 +711,10 @@ impl JournalReader {
 
     /// systemd: journal-file.c:2712-2730 bump_array_index
     fn bump_array_index(i: &mut u64, direction: Direction, n: u64) -> bool {
+        if n == 0 {
+            return false;
+        }
+
         match direction {
             Direction::Down => {
                 if *i >= n - 1 {
@@ -886,8 +908,12 @@ impl JournalReader {
 
     /// systemd: journal-file.c:3321-3333 test_object_offset
     fn test_object_offset(&self, p: u64, needle: u64) -> Result<i32> {
+        // systemd returns -EBADMSG for p == 0 (journal-file.c:3326)
         if p == 0 {
-            return Ok(TEST_GOTO_PREVIOUS);
+            return Err(Error::CorruptObject {
+                offset: 0,
+                reason: "null offset in test_object_offset".into(),
+            });
         }
         if p == needle {
             Ok(TEST_FOUND)

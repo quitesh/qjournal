@@ -20,6 +20,9 @@ pub enum Error {
     #[error("Journal file is truncated at offset {offset:#x}")]
     Truncated { offset: u64 },
 
+    #[error("File too large: {0}")]
+    FileTooLarge(String),
+
     #[error("Field name is invalid: {0:?}")]
     InvalidFieldName(String),
 
