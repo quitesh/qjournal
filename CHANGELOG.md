@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-04-05
+
+### Fixed
+- Merge `SUPPORTED_WRITE`/`SUPPORTED_READ` into single `SUPPORTED` constant matching systemd's `HEADER_INCOMPATIBLE_SUPPORTED` (fixes bug where writer rejected files with compression incompat flags it itself sets).
+- Fix `CHAIN_CACHE_MAX`: 1024 → 20 to match systemd.
+- Remove duplicate `FSPRG_RECOMMENDED_SECPAR` from `fss.rs` (canonical definition lives in `fsprg.rs`, matching systemd's `fsprg.h`).
+
+### Added
+- Add CHANGELOG.md.
+
 ## [0.2.0] - 2026-03-29
 
 ### Changed
@@ -30,6 +40,7 @@ All notable changes to this project will be documented in this file.
 - Optional forward-secure sealing (FSS) via FSPRG.
 - Cache per-data entry-array tail to avoid O(n^2) linked-list walk.
 
+[0.2.1]: https://github.com/quitesh/qjournal/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/quitesh/qjournal/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/quitesh/qjournal/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/quitesh/qjournal/releases/tag/v0.1.0
