@@ -1614,13 +1614,13 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
         let mut total_seen = 0u64;
         let mut cur = entry_array_off;
         while cur != 0 && total_seen < n_entries {
-            let ea_size = read_u64_at(&mut file, cur + 8).unwrap_or(0);
+            let ea_size = read_u64_at(&mut file, cur + 8)?;
             let n = entry_array_n_items(ea_size, compact);
             for i in 0..n {
                 if total_seen >= n_entries {
                     break;
                 }
-                let off = read_entry_array_item(&mut file, cur, i, compact).unwrap_or(0);
+                let off = read_entry_array_item(&mut file, cur, i, compact)?;
                 if off == 0 {
                     break;
                 }
@@ -1628,7 +1628,7 @@ pub fn journal_file_verify<P: AsRef<Path>>(path: P) -> Result<VerifyResult> {
                 last = off;
                 total_seen += 1;
             }
-            let next = read_u64_at(&mut file, cur + 16).unwrap_or(0);
+            let next = read_u64_at(&mut file, cur + 16)?;
             if next == 0 || next <= cur {
                 break;
             }

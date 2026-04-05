@@ -17,7 +17,7 @@ Read and write `.journal` files fully compatible with
 - **Read** entries back, iterate, or query by field value
 - Zstd compression support (enabled by default)
 - Compatible with keyed-hash and compact journal formats
-- No C dependencies — pure Rust with safe memory-mapped I/O
+- Minimal C dependencies — zstd and xz2 link C libraries, lz4_flex is pure Rust
 
 ## Usage
 
@@ -25,7 +25,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-qjournal = "0.1"
+qjournal = "0.2"
 ```
 
 ### Writing
@@ -75,9 +75,13 @@ journalctl --file=/tmp/test.journal
 
 ## Feature flags
 
-| Flag               | Default | Description              |
-|--------------------|---------|--------------------------|
-| `zstd-compression` | yes     | Enable zstd compression  |
+| Flag               | Default | Description                              |
+|--------------------|---------|------------------------------------------|
+| `zstd-compression` | yes     | Enable zstd compression (C dependency)   |
+| `xz-compression`   | no      | Enable xz compression (C dependency)     |
+| `lz4-compression`  | no      | Enable lz4 compression (pure Rust)       |
+| `all-compression`  | no      | Enable all compression codecs            |
+| `fss`              | no      | Forward-secure sealing via FSPRG         |
 
 ## License
 

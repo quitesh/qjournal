@@ -284,27 +284,13 @@ pub fn journal_file_hmac_put_object(
 pub fn journal_file_append_tag(
     state: &mut JournalHmac,
     tag_object: &[u8],
-) -> [u8; TAG_LENGTH] {
-    let hmac = state
-        .hmac
-        .as_mut()
-        .expect("journal_file_append_tag called without active HMAC");
+) -> Result<[u8; TAG_LENGTH], &'static str> {
+    // Feed the tag object via journal_file_hmac_put_object, matching
+    // systemd's journal_file_append_tag (journal-authenticate.c:76):
+    //   r = journal_file_hmac_put_object(f, OBJECT_TAG, o, p);
+    journal_file_hmac_put_object(state, ObjectType::Tag, tag_object, 0, false)?;
 
-    // Feed the tag object's immutable fields into the HMAC before
-    // finalising, matching journal-authenticate.c:73-74:
-    //   journal_file_hmac_put_object(f, OBJECT_TAG, o, p);
-    // ObjectHeader (16 bytes) + seqnum (8) + epoch (8) = 32 bytes.
-    let tag_fixed_end = OBJECT_HEADER_SIZE + 8 + 8; // 32
-    assert!(
-        tag_object.len() >= tag_fixed_end,
-        "tag_object too small for TAG header + seqnum + epoch"
-    );
-    // Feed the object header
-    hmac.update(&tag_object[..OBJECT_HEADER_SIZE]);
-    // Feed seqnum + epoch (skip the tag hash bytes themselves)
-    hmac.update(&tag_object[OBJECT_HEADER_SIZE..tag_fixed_end]);
-
-    let hmac = state.hmac.take().unwrap();
+    let hmac = state.hmac.take().ok_or("journal_file_append_tag called without active HMAC")?;
     let result = hmac.finalize();
     let tag_bytes = result.into_bytes();
 
@@ -312,7 +298,7 @@ pub fn journal_file_append_tag(
 
     let mut tag = [0u8; TAG_LENGTH];
     tag.copy_from_slice(&tag_bytes);
-    tag
+    Ok(tag)
 }
 
 // ── FSS key file loading ─────────────────────────────────────────────────
@@ -475,7 +461,7 @@ pub fn journal_file_parse_verification_key(
     let interval = u64::from_str_radix(&tail[dash_pos + 1..], 16)
         .map_err(|_| "invalid interval hex")?;
 
-    let start_usec = start * interval;
+    let start_usec = start.wrapping_mul(interval);
     let interval_usec = interval;
 
     Ok((seed, start_usec, interval_usec))
@@ -568,8 +554,9 @@ pub fn journal_file_fsprg_seek(
     }
 
     // Full reseed: regenerate master key pair and seek.
-    let secpar = u16::from_le_bytes(fss.header.fsprg_secpar) as u32;
-    let (msk, _mpk) = fsprg::gen_mk(Some(seed), secpar);
+    // systemd always uses FSPRG_RECOMMENDED_SECPAR (journal-authenticate.c:234),
+    // ignoring the FSS header's secpar field for GenMK.
+    let (msk, _mpk) = fsprg::gen_mk(Some(seed), fsprg::FSPRG_RECOMMENDED_SECPAR);
     fsprg::seek(&mut fss.fsprg_state, goal, &msk, seed);
 }
 
@@ -698,8 +685,10 @@ mod tests {
         hmac.hmac.as_mut().unwrap().update(b"test data");
 
         // Build a minimal tag object: ObjectHeader(16) + seqnum(8) + epoch(8) + tag_space(32) = 64
-        let tag_object = [0u8; 64];
-        let tag = journal_file_append_tag(&mut hmac, &tag_object);
+        // First byte is the object type: Tag = 7
+        let mut tag_object = [0u8; 64];
+        tag_object[0] = 7; // ObjectType::Tag
+        let tag = journal_file_append_tag(&mut hmac, &tag_object).unwrap();
         assert_eq!(tag.len(), TAG_LENGTH);
         assert!(!hmac.running);
     }

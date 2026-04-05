@@ -40,37 +40,40 @@ impl MmapCache {
 
     /// Read a u64 at the given offset (little-endian).
     pub fn read_u64(&self, offset: u64) -> Option<u64> {
-        let off = offset as usize;
-        if off + 8 > self.mmap.len() {
+        let off = usize::try_from(offset).ok()?;
+        let end = off.checked_add(8)?;
+        if end > self.mmap.len() {
             return None;
         }
-        let bytes: [u8; 8] = self.mmap[off..off + 8].try_into().ok()?;
+        let bytes: [u8; 8] = self.mmap[off..end].try_into().ok()?;
         Some(u64::from_le_bytes(bytes))
     }
 
     /// Read a u32 at the given offset (little-endian).
     pub fn read_u32(&self, offset: u64) -> Option<u32> {
-        let off = offset as usize;
-        if off + 4 > self.mmap.len() {
+        let off = usize::try_from(offset).ok()?;
+        let end = off.checked_add(4)?;
+        if end > self.mmap.len() {
             return None;
         }
-        let bytes: [u8; 4] = self.mmap[off..off + 4].try_into().ok()?;
+        let bytes: [u8; 4] = self.mmap[off..end].try_into().ok()?;
         Some(u32::from_le_bytes(bytes))
     }
 
     /// Read a single byte.
     pub fn read_u8(&self, offset: u64) -> Option<u8> {
-        let off = offset as usize;
+        let off = usize::try_from(offset).ok()?;
         self.mmap.get(off).copied()
     }
 
     /// Read a slice of bytes. Returns a reference into the mapped memory
     /// (zero-copy).
     pub fn read_bytes(&self, offset: u64, len: usize) -> Option<&[u8]> {
-        let off = offset as usize;
-        if off + len > self.mmap.len() {
+        let off = usize::try_from(offset).ok()?;
+        let end = off.checked_add(len)?;
+        if end > self.mmap.len() {
             return None;
         }
-        Some(&self.mmap[off..off + len])
+        Some(&self.mmap[off..end])
     }
 }
