@@ -629,12 +629,7 @@ pub fn verify_header(
 
     // Incompatible flags check
     let incompat = from_le32(&header.incompatible_flags);
-    let supported = if writable {
-        incompat::SUPPORTED_WRITE
-    } else {
-        incompat::SUPPORTED_READ
-    };
-    let unsupported = incompat & !supported;
+    let unsupported = incompat & !incompat::SUPPORTED;
     if unsupported != 0 {
         return Err(Error::IncompatibleFlags { flags: unsupported });
     }
@@ -1513,9 +1508,7 @@ impl JournalWriter {
 
         let h: Header = unsafe { std::ptr::read_unaligned(hbuf.as_ptr() as *const Header) };
 
-        // DIVERGENCE FIX: previous version checked SUPPORTED_READ flags and
-        // skipped verify_header. We are a WRITER, so must check SUPPORTED_WRITE
-        // and do full verification.
+        // Full header verification (writer mode checks compatible flags too).
         let file_size = file.metadata()?.len();
         // On Linux, pass the current machine_id so verify_header can check it.
         // On non-Linux, machine_id() returns a random value, so skip the check.

@@ -13,6 +13,8 @@ use std::path::Path;
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+
+use crate::fsprg::FSPRG_RECOMMENDED_SEEDLEN;
 use zeroize::Zeroizing;
 
 use crate::def::{
@@ -31,12 +33,6 @@ pub const FSS_HEADER_SIGNATURE: [u8; 8] = *b"KSHHRHLP";
 
 /// Length of an HMAC-SHA256 tag in bytes (256 / 8).
 pub const TAG_LENGTH: usize = 32;
-
-/// FSPRG recommended security parameter (matches systemd's default).
-pub const FSPRG_RECOMMENDED_SECPAR: u16 = 1536;
-
-/// FSPRG recommended seed length in bytes (96 / 8 = 12).
-pub const FSPRG_RECOMMENDED_SEEDLEN: usize = 96 / 8;
 
 /// On-disk FSS header, stored at the beginning of the `.fss` key file.
 #[repr(C, packed)]

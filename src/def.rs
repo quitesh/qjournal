@@ -71,14 +71,10 @@ pub mod incompat {
     /// Mask of all known incompatible flags.
     pub const ANY: u32 = COMPRESSED_XZ | COMPRESSED_LZ4 | KEYED_HASH | COMPRESSED_ZSTD | COMPACT;
 
-    /// Mask of flags we support when writing.
-    /// We support KEYED_HASH (siphash24 keyed with file_id) and COMPACT.
-    pub const SUPPORTED_WRITE: u32 = KEYED_HASH | COMPACT;
-
-    /// Mask of flags we support when reading.
+    /// Mask of flags we support (matches systemd's HEADER_INCOMPATIBLE_SUPPORTED).
     /// Compression flags are conditional on Cargo features, matching systemd's
     /// compile-time HAVE_XZ / HAVE_LZ4 / HAVE_ZSTD gates.
-    pub const SUPPORTED_READ: u32 = {
+    pub const SUPPORTED: u32 = {
         let mut v = KEYED_HASH | COMPACT;
         if cfg!(feature = "xz-compression")   { v |= COMPRESSED_XZ; }
         if cfg!(feature = "lz4-compression")  { v |= COMPRESSED_LZ4; }
