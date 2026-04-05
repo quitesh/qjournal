@@ -65,7 +65,7 @@ pub enum LocationType {
 // ── Chain cache ──────────────────────────────────────────────────────────
 // systemd: journal-file.c:2662-2710
 
-const CHAIN_CACHE_MAX: usize = 1024;
+const CHAIN_CACHE_MAX: usize = 20;
 
 /// systemd: journal-file.c:2662-2669 ChainCacheItem
 #[derive(Debug, Clone)]
